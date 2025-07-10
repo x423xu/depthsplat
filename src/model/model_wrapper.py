@@ -49,6 +49,9 @@ from PIL import Image
 from ..misc.stablize_camera import render_stabilization_path
 from .ply_export import save_gaussian_ply
 
+# for debug only
+import torch.distributed as dist
+
 
 @dataclass
 class OptimizerCfg:
@@ -350,6 +353,8 @@ class ModelWrapper(LightningModule):
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
 
         # Tell the data loader processes about the current step.
+        # Since the pyotrch lightning synchronize the variable automatically, we don't need to maintain a step_tracker shared by processes.
+        # Instead, we can set the global step at each training step end. Here step_tracker is commented out.
         if self.step_tracker is not None:
             self.step_tracker.set_step(self.global_step)
 
@@ -357,7 +362,7 @@ class ModelWrapper(LightningModule):
             os.system("nvidia-smi")
 
         return total_loss
-
+    
     def test_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
         b, v, _, h, w = batch["target"]["image"].shape

@@ -166,3 +166,7 @@ pretrained
 outputs
 output
 checkpoints
+data/
+lightning_logs/
+log
+wandb/

@@ -109,6 +109,7 @@ def overlay(
 def cat(
     main_axis: Axis,
     *images: Iterable[Float[Tensor, "channel _ _"]],
+    # *images: Float[Tensor, "channel _ _"],
     align: Alignment = "center",
     gap: int = 8,
     gap_color: Color = 1,
@@ -148,6 +149,7 @@ def cat(
 
 def hcat(
     *images: Iterable[Float[Tensor, "channel _ _"]],
+    # *images: Float[Tensor, "channel _ _"],
     align: Literal["start", "center", "end", "top", "bottom"] = "start",
     gap: int = 8,
     gap_color: Color = 1,
@@ -170,6 +172,7 @@ def hcat(
 
 def vcat(
     *images: Iterable[Float[Tensor, "channel _ _"]],
+    # *images: Float[Tensor, "channel _ _"],
     align: Literal["start", "center", "end", "left", "right"] = "start",
     gap: int = 8,
     gap_color: Color = 1,

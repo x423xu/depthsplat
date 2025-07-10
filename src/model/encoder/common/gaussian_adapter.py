@@ -5,6 +5,7 @@ from einops import einsum, rearrange
 from jaxtyping import Float
 from torch import Tensor, nn
 import torch.nn.functional as F
+from typing import Union
 
 from ....geometry.projection import get_world_rays
 from ....misc.sh_rotation import rotate_sh
@@ -121,6 +122,208 @@ class GaussianAdapter(nn.Module):
     @property
     def d_in(self) -> int:
         return 7 + 3 * self.d_sh
+    
+class GaussianCubeAdapter(nn.Module):
+    cfg: GaussianAdapterCfg
+
+    def __init__(self, cfg: GaussianAdapterCfg):
+        super().__init__()
+        self.cfg = cfg
+
+        # Create a mask for the spherical harmonics coefficients. This ensures that at
+        # initialization, the coefficients are biased towards having a large DC
+        # component and small view-dependent components.
+        self.register_buffer(
+            "sh_mask",
+            torch.ones((self.d_sh,), dtype=torch.float32),
+            persistent=False,
+        )
+        for degree in range(1, self.cfg.sh_degree + 1):
+            self.sh_mask[degree**2 : (degree + 1) ** 2] = 0.1 * 0.25**degree
+
+    def _create_mask(self,means, cube_length=[64,64,128]):
+        b,v = means.shape[:2]
+        flat_means = rearrange(means.detach(), "b v n i j c -> (b v) (n i j) c")  # BV N 3
+        min_vals, max_vals = torch.min(flat_means, dim=1)[0], torch.max(flat_means, dim=1)[0]  # BV 3
+        range_vals = (max_vals - min_vals).clamp(min=1e-8)  # BV 3
+        normalized_means = (flat_means - min_vals[:, None, :]) / range_vals[:, None, :]  # BV N 3
+        scales = torch.tensor(cube_length, dtype=normalized_means.dtype, device=normalized_means.device)  # 3
+        normalized_means = normalized_means * scales[None, None, :]  # BV N 3
+        indices = normalized_means.round().long()  # BV N 3
+        indices[..., 0] = indices[..., 0].clamp(0, cube_length[0]-1)  # x-dim
+        indices[..., 1] = indices[..., 1].clamp(0, cube_length[1]-1)  # y-dim
+        indices[..., 2] = indices[..., 2].clamp(0, cube_length[2]-1)  # z-dim
+
+        batch_idx = torch.arange(indices.shape[0], device=normalized_means.device)[:,None].expand(indices.shape[0],indices.shape[1])  # B N
+        mask = torch.zeros((indices.shape[0], *cube_length), device=normalized_means.device, dtype=torch.bool)
+        mask[batch_idx, indices[..., 0], indices[..., 1], indices[..., 2]] = True
+        mask = rearrange(mask, "(b v) l m n -> b v l m n", b=b, v=v)  # B V L M N
+        union_mask = mask.any(dim=1)  # B L M N
+        intersect_mask = mask.all(dim=1)  # B L M N
+        return mask, union_mask, intersect_mask
+
+
+
+    def forward(
+        self,
+        extrinsics: Float[Tensor, "*#batch 4 4"],
+        intrinsics: Float[Tensor, "*#batch 3 3"] | None,
+        coordinates: Float[Tensor, "*#batch 2"],
+        depths,
+        opacities,
+        raw_gaussians,
+        image_shape: tuple[int, int],
+        eps: float = 1e-8,
+        point_cloud: Float[Tensor, "*#batch 3"] | None = None,
+        input_images: Tensor | None = None,
+        mask = None,
+        coef = None
+    ) -> Gaussians:
+        # Compute Gaussian means.
+        origins, directions = get_world_rays(coordinates, extrinsics, intrinsics)
+        means = origins + directions * depths[..., None,None]
+        # calculate mask according to the coordinates
+        mask, union_mask_on_v, intersect_mask_on_v = self._create_mask(means, cube_length=[64,64,128]) # (b v l m n), (b l m n), (b l m n)
+        complement_mask_on_v = torch.logical_xor(union_mask_on_v, intersect_mask_on_v)  # b l m n
+        coef = rearrange(coef, "b v -> b v () () ()") * intersect_mask_on_v[:,None,...]  # b v l m n, average in intersection area
+        coef[complement_mask_on_v] = 1.0 # sum up in complement area
+
+
+        # unfold gaussians
+        gaussian_x, gaussian_y, gaussian_z = raw_gaussians.split((64, 64, 128), dim=2)
+        gaussian_compose = torch.einsum("bvlijk, bvmijk, bvnijk -> bvlmnijk", gaussian_x, gaussian_y, gaussian_z)  # bv, c, 128, 64, 64
+
+        opacities_x, opacities_y, opacities_z = opacities.split((64, 64, 128), dim=2)
+        opacities_compose = torch.einsum("bvlij, bvmij, bvnij -> bvlmnij", opacities_x, opacities_y, opacities_z)
+        b, v, l, m,n,i,j,k = gaussian_compose.shape
+
+        gs_per_batch = []
+        gs_per_view = []
+
+
+        # gaussian_compose = rearrange(coef, "b v -> b v () () () () () ()") * gaussian_compose  # b v l m n i j k
+        # opacities_compose = rearrange(coef, "b v -> b v () () () () ()") * opacities_compose  # b v l m n i j
+
+        scales, rotations, sh = gaussian_compose.split((3, 4, 3 * self.d_sh), dim=-1)
+        # initialize params
+        scales = torch.clamp(F.softplus(scales - 4.),
+            min=self.cfg.gaussian_scale_min,
+            max=self.cfg.gaussian_scale_max,
+            )
+
+        assert input_images is not None
+        # Normalize the quaternion features to yield a valid quaternion.
+        rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + eps)
+
+        # [2, 2, 65536, 1, 1, 3, 25]
+        sh = rearrange(sh, "... (xyz d_sh) -> ... xyz d_sh", xyz=3)
+        sh = sh.broadcast_to((*opacities.shape, 3, self.d_sh)) * self.sh_mask
+
+        if input_images is not None:
+            # [B, V, H*W, 1, 1, 3]
+            imgs = rearrange(input_images, "b v c h w -> b v (h w) () () c")
+            # init sh with input images
+            sh[..., 0] = sh[..., 0] + RGB2SH(imgs)
+        
+        '''
+        Why do we add the gaussians, how to justify it?
+        f(v1, v2, ..., vn) = f(v1) + f(v2) + ... + f(vn)
+        '''
+
+        gaussian_compose = (gaussian_compose*mask[..., None,None,None]).sum(dim=1)  # b l m n i j k
+        opacities_compose = (opacities_compose*mask[..., None, None]).sum(dim=1)  # b l m n i j
+        gs_active = []
+        op_active = []
+        for num_b in range(gaussian_compose.shape[0]):
+            gs_b = gaussian_compose[num_b][union_mask[num_b]]  #
+            op_b = opacities_compose[num_b][union_mask[num_b]]  # b v n 1
+            gs_active.append(gs_b)
+            op_active.append(op_b)
+        num_gs = [gs_a.shape[0] for gs_a in gs_active]
+        max_num_gs = max(num_gs)
+        # pad the gaussians and opacities to the same shape
+        gs_all = []
+        op_all = []
+        for gs_a, op_a in zip(gs_active, op_active):
+            if gs_a.shape[0] < max_num_gs:
+                pad_size = max_num_gs - gs_a.shape[0]
+                gs_a = F.pad(gs_a, (0, 0, 0, 0, 0, pad_size), value=0)
+                op_a = F.pad(op_a, (0, 0, 0, pad_size), value=0)
+            gs_all.append(gs_a)
+            op_all.append(op_a)
+        active_gaussians = torch.stack(gs_active, dim=0)  # b h i j k
+        active_opacities = torch.stack(op_active, dim=0)  # b h i j
+        # select active gaussians and opacities
+        # not that easy, here we use for loop to filter out the active gaussians, we plan to use Graph Neural Network to parallel this in the future
+        active_gaussians = rearrange(active_gaussians, " (b v) h i j k -> b v h i j k", b=b, v=v, i=i, j=j, k=k)  # b v n 1 1 c
+        
+        opacities = rearrange(active_opacities, " (b v) h i j -> b v h i j", b=b, v=v)  # b v n 1
+        opacities = opacities.sigmoid()  # b v n 1
+        scales, rotations, sh = active_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
+
+        
+
+        assert input_images is not None
+
+        # Normalize the quaternion features to yield a valid quaternion.
+        rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + eps)
+
+        # [2, 2, 65536, 1, 1, 3, 25]
+        sh = rearrange(sh, "... (xyz d_sh) -> ... xyz d_sh", xyz=3)
+        sh = sh.broadcast_to((*opacities.shape, 3, self.d_sh)) * self.sh_mask
+
+
+        if input_images is not None:
+            # [B, V, H*W, 1, 1, 3]
+            imgs = rearrange(input_images, "b v c h w -> b v (h w) () () c")
+            # init sh with input images
+            sh[..., 0] = sh[..., 0] + RGB2SH(imgs)
+
+        # Create world-space covariance matrices.
+        covariances = build_covariance(scales, rotations)
+        c2w_rotations = extrinsics[..., :3, :3]
+        covariances = c2w_rotations @ covariances @ c2w_rotations.transpose(-1, -2)
+
+        
+
+        means_oracle = means.sum(dim=1, keepdim=True)
+        covariances_oracle = covariances.sum(dim=1, keepdim=True)
+        harmonics_oracle = rotate_sh(sh, c2w_rotations[..., None, :, :]).sum(dim=1, keepdim=True)
+        opacities_oracle = opacities.sum(dim=1, keepdim=True)
+        sacles_oracle = scales.sum(dim=1, keepdim=True)
+        rotations_oracle = rotations.broadcast_to((*scales.shape[:-1], 4)).sum(dim=1, keepdim=True)
+        return Gaussians(
+            means=means_oracle,
+            covariances=covariances_oracle,
+            harmonics=harmonics_oracle,
+            opacities=opacities_oracle,
+            # NOTE: These aren't yet rotated into world space, but they're only used for
+            # exporting Gaussians to ply files. This needs to be fixed...
+            scales=sacles_oracle,
+            rotations=rotations_oracle,
+        )
+    
+    def get_scale_multiplier(
+        self,
+        intrinsics: Float[Tensor, "*#batch 3 3"],
+        pixel_size: Float[Tensor, "*#batch 2"],
+        multiplier: float = 0.1,
+    ) -> Float[Tensor, " *batch"]:
+        xy_multipliers = multiplier * einsum(
+            intrinsics[..., :2, :2].inverse(),
+            pixel_size,
+            "... i j, j -> ... i",
+        )
+        return xy_multipliers.sum(dim=-1)
+
+    @property
+    def d_sh(self) -> int:
+        return (self.cfg.sh_degree + 1) ** 2
+
+    @property
+    def d_in(self) -> int:
+        return 7 + 3 * self.d_sh
+
 
 
 def RGB2SH(rgb):

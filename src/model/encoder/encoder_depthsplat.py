@@ -5,12 +5,14 @@ import torch
 from einops import rearrange
 from jaxtyping import Float
 from torch import Tensor, nn
+from torch import einsum
+from einops import repeat,rearrange
 
 from ...dataset.shims.patch_shim import apply_patch_shim
 from ...dataset.types import BatchedExample, DataShim
 from ...geometry.projection import sample_image_grid
 from ..types import Gaussians
-from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg
+from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, GaussianCubeAdapter
 from .encoder import Encoder
 from .visualization.encoder_visualizer_depthsplat_cfg import EncoderVisualizerDepthSplatCfg
 
@@ -67,6 +69,8 @@ class EncoderDepthSplatCfg:
 
     # multi-view matching
     local_mv_match: int
+
+    gs_cube: bool = False  # whether to use the gs cube model
 
 
 class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
@@ -136,6 +140,51 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         # first 3: opacity, offset_xy
         nn.init.zeros_(self.gaussian_head[-1].weight[3:6])
         nn.init.zeros_(self.gaussian_head[-1].bias[3:6])
+
+        # whether to use the gs cube model
+        self.gs_cube = cfg.gs_cube
+        if cfg.gs_cube:
+            # use the gs cube model
+            self.gaussian_head_x = nn.Sequential(
+                nn.Conv2d(in_channels, num_gaussian_parameters, 3, 1, 1, padding_mode='replicate'),
+                nn.GELU(),
+                nn.Conv2d(num_gaussian_parameters,num_gaussian_parameters, 3, 1, 1, padding_mode='replicate'),
+                nn.GELU(),
+                nn.AdaptiveAvgPool2d((64, 1)), # if we want rank=k, just change to (64, k)
+                nn.Flatten(-2, -1),
+                nn.Linear(64, 64),
+            )
+            self.gaussian_head_y = nn.Sequential(
+                nn.Conv2d(in_channels, num_gaussian_parameters, 3, 1, 1, padding_mode='replicate'),
+                nn.GELU(),
+                nn.Conv2d(num_gaussian_parameters,num_gaussian_parameters, 3, 1, 1, padding_mode='replicate'),
+                nn.GELU(),
+                nn.AdaptiveAvgPool2d((64, 1)),
+                nn.Flatten(-2, -1),
+                nn.Linear(64, 64),
+            )
+            self.gaussian_head_z = nn.Sequential(
+                nn.Conv2d(256*256, num_gaussian_parameters, 3, 1, 1, padding_mode='replicate'),
+                nn.GELU(),
+                nn.Conv2d(num_gaussian_parameters,num_gaussian_parameters, 3, 1, 1, padding_mode='replicate'),
+                nn.GELU(),
+                nn.AdaptiveMaxPool2d((128, 1)),
+                nn.Flatten(-2, -1),
+                nn.Linear(128, 128),
+            )
+            self.gaussian_cube_adapter = GaussianCubeAdapter(cfg.gaussian_adapter)
+            self.coef_module = nn.Sequential(
+                nn.Conv2d(in_channels, num_gaussian_parameters, 3, 1, 1, padding_mode='replicate'),
+                nn.BatchNorm2d(num_gaussian_parameters),
+                nn.GELU(),
+                nn.Conv2d(num_gaussian_parameters,num_gaussian_parameters, 3, 1, 1, padding_mode='replicate'),
+                nn.BatchNorm2d(num_gaussian_parameters),
+                nn.GELU(),
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(-3, -1),
+                nn.Linear(num_gaussian_parameters,1),
+                # nn.Tanh(),
+            )
 
     def forward(
         self,
@@ -245,6 +294,31 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
 
         depths = rearrange(depth, "b v h w -> b v (h w) () ()")
 
+        # get the gs_cube mask, this mask is in camera coordinate, this is not what we want
+        # we should calculate it from depths. It is noted that if the cube is scaled, the depth should be scaled as well.
+        if self.gs_cube:
+            # s1: interpolate to cube size
+            depth_cube = F.interpolate(depth.detach(),
+                                       size=(64, 64),
+                                        mode='bilinear',
+                                        align_corners=True,
+                                        )
+            depth_cube.clamp_(min=0.5, max=100)  # avoid division by zero
+            # s2: get inverse depth raning 0,1
+            depth_cube_inverse = 1. / depth_cube # b v 64 64
+            # mask_init = torch.zeros_like(results_dict['match_probs'][-1]) #bv, 64,64,128
+            linear_space = (
+                    torch.linspace(0, 1, results_dict['match_probs'][-1].shape[1]+1)
+                    .type_as(depth_cube_inverse)
+                    .view(1, 1, results_dict['match_probs'][-1].shape[1]+1, 1, 1)
+                )  # [1, 1, D, 1, 1]
+            linear_start = linear_space[:,:,:-1,...]
+            linear_end = linear_space[:,:,1:,...]
+            mask = (depth_cube_inverse.unsqueeze(2) >= linear_start) & (
+                depth_cube_inverse.unsqueeze(2) < linear_end)  # [b, v, D, 64, 64]
+            mask = rearrange(mask, "b v d h w -> b v h w d")
+            
+
         # [B, V, H*W, 1, 1]
         densities = rearrange(
             match_prob, "(b v) c h w -> b v (c h w) () ()", b=b, v=v)
@@ -314,6 +388,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                     len(depth_preds), 1, 1, 1, 1) if self.cfg.init_sh_input_img else None,
             )
 
+
         else:
             gaussians = self.gaussian_adapter.forward(
                 rearrange(context["extrinsics"],
@@ -330,6 +405,80 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                 (h, w),
                 input_images=sh_input_images if self.cfg.init_sh_input_img else None,
             )
+
+            if self.gs_cube:
+                # prepare gs_cube for rendering
+                # seperately train gs_cube
+                gs_in = out.detach()
+                # here a NxHxW tensor is decomposed into three tensors:
+                # gaussians_x: [BV, C, 64]
+                # gaussians_y: [BV, C, 64]
+                # gaussians_z: [BV, C, 128]
+                # the compression ratio is 256*256*2 / (64 + 64 + 128) = 512    
+                gaussians_x = self.gaussian_head_x(rearrange(gs_in, "n c h w -> n c w h")) # bv, c, 64
+                gaussians_y = self.gaussian_head_y(gs_in) # bv, c, 64
+                gaussians_z = self.gaussian_head_z(rearrange(gs_in, "n c h w -> n (h w) c ()"))# bv, c, 128
+                coef = self.coef_module(gs_in) # bv, c, 1
+
+                raw_gaussian_cube_cp = torch.cat([gaussians_x, gaussians_y, gaussians_z], dim=-1) # bv, c, 64+64+128
+                raw_gaussian_cube_cp = rearrange(raw_gaussian_cube_cp, "(b v) c n -> b v n c", b=b, v=v)
+
+                # getting opacities from raw_gaussian_cube_cp
+                raw_opacities_cube_cp = raw_gaussian_cube_cp[..., :1].unsqueeze(-1)
+                raw_gaussian_cube_cp = raw_gaussian_cube_cp[..., 1:]
+
+                # getting ray in camera coordinate
+                xy_ray_cube, _ = sample_image_grid((64, 64), device)
+                xy_ray_cube = rearrange(xy_ray_cube, "h w xy -> (h w) () xy")
+                gaussians_cube_cp = rearrange(
+                    raw_gaussian_cube_cp,
+                    "... (srf c) -> ... srf c",
+                    srf=self.cfg.num_surfaces,
+                ) # b v n srf c
+                # offset_xy_cube = gaussians_cube_cp[..., :2].sigmoid()  
+                offset_xy_cube = F.interpolate(
+                    rearrange(offset_xy.detach(), "b v (h w) srf xy -> (b v) (srf xy) h w",srf=self.cfg.num_surfaces,xy=2, h=h, w=w), size=(64, 64), mode='bilinear', align_corners=True
+                )
+                offset_xy_cube = rearrange(offset_xy_cube, "(b v) (srf xy) h w -> b v (h w) srf xy", b=b, v=v, h=64, w=64,srf=self.cfg.num_surfaces,xy=2)  # b v 4096 1 2
+
+                pixel_size = 1 / \
+                    torch.tensor((64, 64), dtype=torch.float32, device=device)
+                xy_ray_cube = xy_ray_cube + (offset_xy_cube - 0.5) * pixel_size # b v n srf 2
+                sh_input_images_cube = F.interpolate(
+                    rearrange(context["image"], "b v c h w -> (b v) c h w"),
+                    size=(64, 64),
+                    mode='bilinear',
+                    align_corners=True,
+                )
+                sh_input_images_cube = rearrange(
+                    sh_input_images_cube, "(b v) c h w -> b v c h w", b=b, v=v, h=64, w=64
+                )
+
+                gaussians_cube = self.gaussian_cube_adapter.forward(
+                            rearrange(context["extrinsics"],
+                                    "b v i j -> b v () () () i j"),
+                            rearrange(context["intrinsics"],
+                                    "b v i j -> b v () () () i j"),
+                            rearrange(xy_ray_cube, "b v r srf xy -> b v r srf () xy"),
+                            rearrange(depth_cube, "b v h w -> b v (h w) ()"), # b v 64 64
+                            raw_opacities_cube_cp, # b v n 1
+                            rearrange(
+                                gaussians_cube_cp[..., 2:],
+                                "b v r srf c -> b v r srf () c",
+                            ),
+                            (h, w),
+                            input_images=sh_input_images_cube if self.cfg.init_sh_input_img else None,
+                            mask = mask,
+                            coef = coef
+                        )
+
+                # gaussian_cube = einsum("ijk, ijl, ijm -> ijklm", gaussians_z, gaussians_x, gaussians_y) # bv, c, 128, 64, 64
+                # gaussian_cube = gaussian_cube*mask_dict["mask"].unsqueeze(1) # bv, c, 128, 64, 64
+                # gaussian_cube = rearrange(gaussian_cube, "(bv) c d h w-> b v c d h w", b=b, v=v)
+
+                # this should be added in ga_adapter after mapping to world coordinates
+                # gaussian_cube = gaussian_cube.sum(dim=1) # sum over v, [B, C, D, H, W]
+
 
         # Dump visualizations if needed.
         if visualization_dump is not None:
@@ -362,6 +511,25 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             ),
         )
 
+        gaussian_cube = Gaussians(
+            rearrange(
+                gaussians_cube.means,
+                "b v r srf spp xyz -> b (v r srf spp) xyz",
+            ),
+            rearrange(
+                gaussians_cube.covariances,
+                "b v r srf spp i j -> b (v r srf spp) i j",
+            ),
+            rearrange(
+                gaussians_cube.harmonics,
+                "b v r srf spp c d_sh -> b (v r srf spp) c d_sh",
+            ),
+            rearrange(
+                gaussians_cube.opacities,
+                "b v r srf spp -> b (v r srf spp)",
+            ),
+        )
+
         if self.cfg.return_depth:
             # return depth prediction for supervision
             depths = rearrange(
@@ -373,7 +541,9 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                 "gaussians": gaussians,
                 "depths": depths
             }
-
+        if self.gs_cube:
+            # return gaussians and gaussian_cube
+            return gaussians_cube
         return gaussians
 
     def get_data_shim(self) -> DataShim:

@@ -7,10 +7,10 @@ defaults:
 
 wandb:
   project: depthsplat
-  entity: placeholder
-  name: placeholder
+  entity: xxy
+  name: default
   mode: online
-  id: null
+  id: NULL
 
 mode: train
 
@@ -95,3 +95,6 @@ trainer:
 output_dir: outputs/tmp
 
 use_plugins: false
+
+model_extra:
+  gs_cube: false

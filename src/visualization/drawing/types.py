@@ -12,6 +12,7 @@ Vector = Union[
     Iterable[Real],
     Shaped[Tensor, "3"],
     Shaped[Tensor, "batch 3"],
+    # Shaped[Tensor, "batch 2"],
 ]
 
 

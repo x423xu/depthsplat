@@ -19,6 +19,7 @@ from pytorch_lightning.loggers.wandb import WandbLogger
 from pytorch_lightning.plugins.environments import LightningEnvironment
 
 
+
 # Configure beartype and jaxtyping.
 with install_import_hook(
     ("src",),
@@ -47,6 +48,8 @@ def cyan(text: str) -> str:
     config_name="main",
 )
 def train(cfg_dict: DictConfig):
+
+
     if cfg_dict["mode"] == "train" and cfg_dict["train"]["eval_model_every_n_val"] > 0:
         eval_cfg_dict = copy.deepcopy(cfg_dict)
         dataset_dir = str(cfg_dict["dataset"]["roots"]).lower()
@@ -88,6 +91,7 @@ def train(cfg_dict: DictConfig):
         if cfg_dict.wandb.id is not None:
             wandb_extra_kwargs.update({'id': cfg_dict.wandb.id,
                                        'resume': "must"})
+            # wandb_extra_kwargs.update({'id': cfg_dict.wandb.id})
         logger = WandbLogger(
             entity=cfg_dict.wandb.entity,
             project=cfg_dict.wandb.project,
@@ -131,21 +135,27 @@ def train(cfg_dict: DictConfig):
 
     # This allows the current step to be shared with the data loader processes.
     step_tracker = StepTracker()
-
+    # step_tracker = None
+    print(torch.cuda.device_count(), "GPUs available")
     trainer = Trainer(
         max_epochs=-1,
         accelerator="gpu",
         logger=logger,
         devices=torch.cuda.device_count(),
         strategy='ddp' if torch.cuda.device_count() > 1 else "auto",
+        # strategy=DDPStrategy(find_unused_parameters=False，
+        #                      cluster_environment=None,  # Default uses Gloo
+        #                      process_group_backend="gloo") if torch.cuda.device_count() > 1 else "auto",
         callbacks=callbacks,
         val_check_interval=cfg.trainer.val_check_interval,
-        enable_progress_bar=cfg.mode == "test",
+        # enable_progress_bar=cfg.mode == "test",
+        enable_progress_bar=True,
         gradient_clip_val=cfg.trainer.gradient_clip_val,
         max_steps=cfg.trainer.max_steps,
         num_sanity_val_steps=cfg.trainer.num_sanity_val_steps,
         num_nodes=cfg.trainer.num_nodes,
         plugins=LightningEnvironment() if cfg.use_plugins else None,
+        profiler=None
     )
     torch.manual_seed(cfg_dict.seed + trainer.global_rank)
 

@@ -23,6 +23,7 @@ class ViewSamplerBoundedCfg:
 
 class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
     def schedule(self, initial: int, final: int) -> int:
+
         fraction = self.global_step / self.cfg.warm_up_steps
         return min(initial + int((final - initial) * fraction), final)
 

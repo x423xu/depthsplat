@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-
+CUDA_VISIBLE_DEVICES=6,7,8,9 python -m src.main +experiment=re10k dataset.roots=[/data0/xxy/data/re10k] data_loader.train.batch_size=8 dataset.test_chunk_interval=100 trainer.max_steps=300000 model.encoder.upsample_factor=4 model.encoder.lowest_feature_resolution=4 checkpointing.pretrained_monodepth=pretrained/depth_anything_v2_vits.pth checkpointing.pretrained_mvdepth=pretrained/gmflow-scale1-things-e9887eda.pth output_dir=checkpoints/re10k-256x256-depthsplat-small
 # small model
 # train on 4x GPUs (>=80GB VRAM) for 150K steps, batch size 8 on each gpu 
 python -m src.main +experiment=re10k \

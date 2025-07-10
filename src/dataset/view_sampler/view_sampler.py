@@ -31,6 +31,7 @@ class ViewSampler(ABC, Generic[T]):
         self.is_overfitting = is_overfitting
         self.cameras_are_circular = cameras_are_circular
         self.step_tracker = step_tracker
+        # self._step = 0
 
     @abstractmethod
     def sample(

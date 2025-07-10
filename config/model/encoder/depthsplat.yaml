@@ -53,3 +53,5 @@ gaussian_regressor_channels: 64
 
 # only depth
 train_depth_only: false
+
+gs_cube: false

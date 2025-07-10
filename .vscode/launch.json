@@ -1,0 +1,79 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "2,3",
+                "MASTER_ADDR": "localhost",
+                "MASTER_PORT": "12345",
+            },
+        },
+        {
+            "name": "Render re10k 256x256",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.main",
+            // "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1",
+            },
+            "args": [
+                "+experiment=re10k",
+                "dataset.test_chunk_interval=100",
+                "dataset.roots=[/data0/xxy/data/re10k]",
+                "model.encoder.num_scales=2",
+                "model.encoder.upsample_factor=2",
+                "model.encoder.lowest_feature_resolution=4",
+                "model.encoder.monodepth_vit_type=vitl",
+                "model.encoder.gaussian_adapter.gaussian_scale_max=0.1",
+                "checkpointing.pretrained_model=pretrained/depthsplat-gs-large-re10k-256x256-view2-e0f0f27a.pth",
+                "mode=test",
+                "dataset/view_sampler=evaluation",
+                "dataset.view_sampler.index_path=assets/evaluation_index_re10k_video.json",
+                "test.save_video=true",
+                "test.compute_scores=true",
+                "test.render_chunk_size=10",
+                "output_dir=outputs/depthsplat-re10k-256x256-with-score"
+            ]
+        },
+        {
+            "name": "Train re10k 256x256",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.main",
+            // "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "5",
+                // "MASTER_ADDR": "localhost",
+                // "MASTER_PORT": "12345",
+            },
+            "args": [
+                "+experiment=re10k",
+                "dataset.roots=[/data0/xxy/data/re10k]",
+                "data_loader.train.batch_size=2",
+                "wandb.mode=disabled",
+                "dataset.test_chunk_interval=10",
+                "trainer.max_steps=300000",
+                "model.encoder.upsample_factor=4",
+                "model.encoder.lowest_feature_resolution=4",
+                "model.encoder.gs_cube=true",
+                "checkpointing.pretrained_model=/data0/xxy/code/depthsplat/checkpoints/re10k-256x256-depthsplat-small/checkpoints_backups/epoch_15-step_176096.ckpt",
+                "checkpointing.pretrained_monodepth=pretrained/depth_anything_v2_vits.pth",
+                "checkpointing.pretrained_mvdepth=pretrained/gmflow-scale1-things-e9887eda.pth",
+                "output_dir=checkpoints/gscube-re10k-256x256-depthsplat-small",
+            ]
+        },
+    ],
+}
