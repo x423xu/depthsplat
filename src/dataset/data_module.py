@@ -98,6 +98,7 @@ class DataModule(LightningDataModule):
             generator=self.get_generator(self.data_loader_cfg.train),
             worker_init_fn=worker_init_fn,
             persistent_workers=self.get_persistent(self.data_loader_cfg.train),
+            # pin_memory=True,
         )
 
     def val_dataloader(self):

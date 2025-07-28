@@ -55,3 +55,7 @@ gaussian_regressor_channels: 64
 train_depth_only: false
 
 gs_cube: false
+
+gaussians_per_cell: 4
+down_strides: [2, 2]
+cell_scale: 1

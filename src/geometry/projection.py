@@ -103,10 +103,11 @@ def get_world_rays(
         intrinsics,
     )
     directions = directions / directions[..., -1:]
-
+    
     # Transform ray directions to world coordinates.
     directions = homogenize_vectors(directions)
     directions = transform_cam2world(directions, extrinsics)[..., :-1]
+    
 
     # Tile the ray origins to have the same shape as the ray directions.
     origins = extrinsics[..., :-1, -1].broadcast_to(directions.shape)

@@ -12,9 +12,9 @@ ENCODERS = {
 EncoderCfg = EncoderDepthSplatCfg
 
 
-def get_encoder(cfg: EncoderCfg) -> tuple[Encoder, Optional[EncoderVisualizer]]:
+def get_encoder(cfg: EncoderCfg, gs_cube: bool) -> tuple[Encoder, Optional[EncoderVisualizer]]:
     encoder, visualizer = ENCODERS[cfg.name]
-    encoder = encoder(cfg)
+    encoder = encoder(cfg, gs_cube)
     if visualizer is not None:
         visualizer = visualizer(cfg.visualizer, encoder)
     return encoder, visualizer

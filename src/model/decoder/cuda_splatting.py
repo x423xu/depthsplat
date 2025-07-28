@@ -9,9 +9,74 @@ from diff_gaussian_rasterization import (
 from einops import einsum, rearrange, repeat
 from jaxtyping import Float
 from torch import Tensor
+import matplotlib.pyplot as plt
 
 from ...geometry.projection import get_fov, homogenize_points
 
+
+def eval_sh_bases(order: int, dirs: torch.Tensor) -> torch.Tensor:
+    """
+    计算球谐基函数值（支持 3 阶）
+    Args:
+        order: 球谐阶数（此处固定为 3）
+        dirs: 方向向量 [N, 3]，已归一化
+    Returns:
+        sh_bases: 球谐基值 [N, (order+1)**2]
+    """
+    # 确保输入方向已归一化
+    assert torch.allclose(dirs.norm(dim=-1), torch.ones_like(dirs[:, 0])), "方向向量未归一化！"
+    
+    # 解构方向向量分量 [N, 3] -> [N]
+    x, y, z = dirs.unbind(-1)
+    
+    if order == 3:
+        sh_bases = torch.stack([
+            # l=0, m=0
+            0.28209479177387814 * torch.ones_like(x),  # Y_{0}^{0}
+            
+            # l=1, m=-1,0,1
+            -0.4886025119029199 * y,                  # Y_{1}^{-1} (原代码符号错误，已修正)
+            0.4886025119029199 * z,                   # Y_{1}^{0}
+            0.4886025119029199 * x,                   # Y_{1}^{1}
+            
+            # l=2, m=-2,-1,0,1,2
+            1.0925484305920792 * x * y,                # Y_{2}^{-2}
+            -1.0925484305920792 * y * z,               # Y_{2}^{-1}
+            0.9461746957575601 * (3.0 * z**2 - 1),     # Y_{2}^{0}
+            -1.0925484305920792 * x * z,               # Y_{2}^{1}
+            0.5462742152960396 * (x**2 - y**2),        # Y_{2}^{2}
+            
+            # # l=3, m=-3,-2,-1,0,1,2,3
+            # -0.5900435899266435 * y * (3*x**2 - y**2), # Y_{3}^{-3}
+            # 1.445305721320277 * x * y * z,              # Y_{3}^{-2}
+            # -0.4570457994644658 * y * (5*z**2 - 1),     # Y_{3}^{-1}
+            # 0.31539156525252005 * (5*z**3 - 3*z),      # Y_{3}^{0}
+            # -0.4570457994644658 * x * (5*z**2 - 1),     # Y_{3}^{1}
+            # 0.72892666017483 * z * (x**2 - y**2),       # Y_{3}^{2}
+            # -0.5900435899266435 * x * (x**2 - 3*y**2)  # Y_{3}^{3}
+        ], dim=-1)  # 沿最后一维堆叠 → [N, 9]
+        
+        return sh_bases  # 形状 [N, 9]
+
+def harmonic_coeffs_to_rgb(sh_coeffs,points,extrinsic):          # Returns [N, 3] RGB in [0,1]
+    # Compute view direction
+    cam_pos = extrinsic[:3, 3]                       # Camera position
+    view_dir = points - cam_pos.unsqueeze(0)          # [N, 3]
+    view_dir = torch.nn.functional.normalize(view_dir, dim=-1)          # Normalize
+    
+    # Evaluate SH bases for view_dir
+    sh_bases = eval_sh_bases(order=3, dirs=view_dir)  # [N, 9]
+    
+    # Compute RGB: dot product per channel
+    rgb = torch.einsum("nck,nk->nc", sh_coeffs, sh_bases)
+    
+    # Normalize and clamp
+    rgb = rgb * 0.28209479177387814 + 0.5  # Scale and offset [4](@ref)
+
+    # points from world to camera space
+    # points_camera_space = einsum(extrinsic.inverse(), homogenize_points(points), "i j, b j -> b i")[:, :3]  # [N, 3]
+    # Use Z coordinate for depth
+    return torch.clamp(rgb, 0, 1)
 
 def get_projection_matrix(
     near: Float[Tensor, " batch"],
@@ -42,6 +107,26 @@ def get_projection_matrix(
     result[:, 2, 3] = -(far * near) / (far - near)
     return result
 
+def render_pcs(points, colors, opacities, num):
+    points = points.squeeze().detach().cpu().numpy()
+    colors = colors.squeeze().detach().cpu().numpy()
+    opacities = opacities.squeeze().detach().cpu().numpy()
+    # Load point cloud
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(
+        points[:, 0],  # X-axis
+        points[:, 2],  # Y-axis
+        points[:, 1],  # Z-axis
+        c=colors,      # Color
+        marker='o',    # Point shape
+        s=1,           # Point size
+        alpha=1     # Transparency
+    )
+    ax.invert_yaxis()
+    ax.invert_zaxis()  
+    fig.savefig(f"point_cloud_{num}.png", dpi=300)
+    plt.close(fig)
 
 def render_cuda(
     extrinsics: Float[Tensor, "batch 4 4"],
@@ -85,6 +170,14 @@ def render_cuda(
     view_matrix = rearrange(extrinsics.inverse(), "b i j -> b j i")
     full_projection = view_matrix @ projection_matrix
 
+    '''
+    let us check what happed for my rendering
+    1. render the points in world coordinates
+    2. render the camera, fov, near, far in world coordinates
+    3. get the visible points inside fov
+    '''
+
+
     all_images = []
     all_radii = []
     for i in range(b):
@@ -111,6 +204,7 @@ def render_cuda(
         )
         rasterizer = GaussianRasterizer(settings)
 
+
         row, col = torch.triu_indices(3, 3)
 
         image, radii = rasterizer(
@@ -124,6 +218,7 @@ def render_cuda(
         all_images.append(image)
         all_radii.append(radii)
     return torch.stack(all_images)
+
 
 
 def render_cuda_orthographic(

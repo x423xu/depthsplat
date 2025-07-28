@@ -49,9 +49,6 @@ from PIL import Image
 from ..misc.stablize_camera import render_stabilization_path
 from .ply_export import save_gaussian_ply
 
-# for debug only
-import torch.distributed as dist
-
 
 @dataclass
 class OptimizerCfg:
@@ -121,6 +118,7 @@ class ModelWrapper(LightningModule):
     train_cfg: TrainCfg
     step_tracker: StepTracker | None
     eval_data_cfg: Optional[DatasetCfg | None]
+    train_controller_cfg: None
 
     def __init__(
         self,
@@ -133,6 +131,7 @@ class ModelWrapper(LightningModule):
         losses: list[Loss],
         step_tracker: StepTracker | None,
         eval_data_cfg: Optional[DatasetCfg | None] = None,
+        train_controller_cfg=None,
     ) -> None:
         super().__init__()
         self.optimizer_cfg = optimizer_cfg
@@ -148,9 +147,18 @@ class ModelWrapper(LightningModule):
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
 
+        # when training the gscube, the base_model is freezed
+        self.gs_cube = train_controller_cfg.gs_cube if train_controller_cfg else False
+        if not train_controller_cfg.base_model:
+            for name, param in self.encoder.named_parameters():
+                if not "gs_cube_encoder" in name:
+                    param.requires_grad = False
+
         # This is used for testing.
         self.benchmarker = Benchmarker()
         self.eval_cnt = 0
+
+
 
         if self.test_cfg.compute_scores:
             self.test_step_outputs = {}
@@ -161,14 +169,25 @@ class ModelWrapper(LightningModule):
         _, _, _, h, w = batch["target"]["image"].shape
 
         # Run the model.
-        gaussians = self.encoder(
-            batch["context"], self.global_step, False, scene_names=batch["scene"]
-        )
+        try:
+            gaussians = self.encoder(
+                batch["context"], self.global_step, False, scene_names=batch["scene"]
+            )
+        except RuntimeError as e:
+            print(f"Runtime error in encoder: {e}")
+            print(f'global_step: {self.global_step}, batch_idx: {batch_idx}, scene_names: {batch["scene"]}')
+            return torch.tensor(0.0, requires_grad=True)
 
         if isinstance(gaussians, dict):
+            if self.gs_cube:
+                nog_pb = gaussians["nog_pb"]
+                nog_min = gaussians["nog_min"]
+                self.log("train/nog_pb", nog_pb, prog_bar=True)
+                self.log("train/nog_min", nog_min, prog_bar=True)
             pred_depths = gaussians["depths"]
             gaussians = gaussians["gaussians"]
-
+            
+        
         supervise_intermediate_depth = False
 
         if gaussians.means.size(0) != batch["target"]["extrinsics"].size(0):

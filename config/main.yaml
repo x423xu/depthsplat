@@ -96,5 +96,9 @@ output_dir: outputs/tmp
 
 use_plugins: false
 
-model_extra:
+# model_extra:
+#   gs_cube: ${train_controller/gs_cube}
+
+train_controller:
   gs_cube: false
+  base_model: false

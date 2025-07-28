@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 import torch
-from einops import einsum, rearrange
+from einops import einsum, rearrange, repeat
 from jaxtyping import Float
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -329,3 +329,150 @@ class GaussianCubeAdapter(nn.Module):
 def RGB2SH(rgb):
     C0 = 0.28209479177387814
     return (rgb - 0.5) / C0
+
+
+class DenseGaussianAdapter(nn.Module):
+    cfg: GaussianAdapterCfg
+
+    def __init__(self, cfg: GaussianAdapterCfg):
+        super().__init__()
+        self.cfg = cfg
+
+        # Create a mask for the spherical harmonics coefficients. This ensures that at
+        # initialization, the coefficients are biased towards having a large DC
+        # component and small view-dependent components.
+        self.register_buffer(
+            "sh_mask",
+            torch.ones((self.d_sh,), dtype=torch.float32),
+            persistent=False,
+        )
+        for degree in range(1, self.cfg.sh_degree + 1):
+            self.sh_mask[degree**2 : (degree + 1) ** 2] = 0.1 * 0.25**degree
+
+    def forward(
+        self,
+        extrinsics: Float[Tensor, "*#batch 4 4"],
+        intrinsics: Float[Tensor, "*#batch 3 3"] | None,
+        coordinates,
+        opacities,
+        gs_cube,
+        eps: float = 1e-8,
+        input_images: Tensor | None = None,
+        gpc = 1
+    ) -> Gaussians:
+        
+        assert input_images is not None
+
+        batch_feats = []
+        batch_opacities = []
+        batch_imgs = []
+        batch_coords = []
+        max_len = 0
+        b,v,_,_ = extrinsics.shape
+        coords = gs_cube.C
+
+        for i in range(b):
+            selected_ind = torch.where(coords[:, 0] == i)[0]
+            if selected_ind.shape[0] > max_len:
+                max_len = selected_ind.shape[0]
+        
+        for i in range(b):
+            selected_ind = torch.where(coords[:, 0] == i)[0]
+            feats_i = gs_cube.F[selected_ind]
+            opacities_i = opacities[selected_ind]
+            imgs_i = input_images[selected_ind]
+            coords_i = coordinates[selected_ind]
+            
+            if selected_ind.shape[0] < max_len:
+                feats_pad = torch.zeros((max_len - selected_ind.shape[0], *feats_i.shape[1:]), device=feats_i.device, dtype=feats_i.dtype)
+                feats_cat = torch.cat([feats_i, feats_pad], dim=0)
+                opacities_pad = torch.zeros((max_len - selected_ind.shape[0], *opacities_i.shape[1:]), device=opacities_i.device, dtype=opacities_i.dtype)
+                opacities_cat = torch.cat([opacities_i, opacities_pad], dim=0)
+                imgs_pad = torch.zeros((max_len - selected_ind.shape[0], *imgs_i.shape[1:]), device=imgs_i.device, dtype=imgs_i.dtype)
+                imgs_cat = torch.cat([imgs_i, imgs_pad], dim=0)
+                coords_pad = torch.zeros((max_len - selected_ind.shape[0], *coords_i.shape[1:]), device=coords_i.device, dtype=coords_i.dtype)
+                coords_cat = torch.cat([coords_i, coords_pad], dim=0)
+                batch_coords.append(coords_cat)
+                batch_imgs.append(imgs_cat)       
+                batch_opacities.append(opacities_cat)
+                batch_feats.append(feats_cat)
+            else:
+                batch_coords.append(coords_i)
+                batch_imgs.append(imgs_i)
+                batch_opacities.append(opacities_i)
+                batch_feats.append(feats_i)
+        batch_coords = torch.stack(batch_coords, dim=0)  # [B, N, 3]
+        batch_feats = torch.stack(batch_feats, dim=0)  # [B, N, C*gpc]
+        batch_feats = rearrange(batch_feats, "b n (c gpc) -> b n c gpc", gpc=gpc)  # [B, N, C, gpc]
+        batch_imgs = torch.stack(batch_imgs, dim=0)
+        batch_opacities = torch.stack(batch_opacities, dim=0) 
+        batch_opacities = rearrange(batch_opacities, "b n l gpc -> b n gpc l ()")
+        batch_feats = rearrange(batch_feats, "b n c gpc -> b n gpc c") 
+        scales, rotations, sh = batch_feats.split((3, 4, 3 * self.d_sh), dim=-1)
+
+        scales = torch.clamp(F.softplus(scales-4.0),
+            min=self.cfg.gaussian_scale_min,
+            max=self.cfg.gaussian_scale_max,
+            )
+
+        
+
+        # Normalize the quaternion features to yield a valid quaternion.
+        rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + eps)
+
+        # 
+        sh = rearrange(sh, "b r gpc (xyz d_sh)  -> b r gpc () () xyz d_sh", xyz=3)
+        sh = sh.broadcast_to((*batch_opacities.shape, 3, self.d_sh)) * self.sh_mask
+        # [B, V, H*W, 1, 1, 3]
+        imgs = rearrange(batch_imgs, "b r c -> b r () () c")
+        imgs = repeat(imgs, "b r m n c -> b r gpc m n c", gpc=gpc)
+        # init sh with input images
+        sh[..., 0] = sh[..., 0] + RGB2SH(imgs)
+
+        # Create world-space covariance matrices.
+        covariances = build_covariance(scales, rotations)
+
+        
+
+
+        # return Gaussians(
+        #     means=rearrange(batch_coords, "b r xyz -> b () r () () xyz"),
+        #     covariances=rearrange(covariances, "b r m n -> b () r () () m n"),
+        #     harmonics=rearrange(sh, "b r l m n k -> b () r l m n k"),
+        #     opacities=rearrange(batch_opacities, "b r m n -> b () r m n"),
+        #     # NOTE: These aren't yet rotated into world space, but they're only used for
+        #     # exporting Gaussians to ply files. This needs to be fixed...
+        #     scales=rearrange(scales, "b r n -> b () r () () n"),
+        #     rotations=rearrange(rotations.broadcast_to((*scales.shape[:-1], 4)), "b r n -> b () r () () n"),
+        # )
+        return Gaussians(
+            means=rearrange(batch_coords, "b r gpc xyz -> b (r gpc) xyz"),
+            covariances=rearrange(covariances, "b r gpc m n -> b (r gpc) m n"),
+            harmonics=rearrange(sh, "b r gpc l m n k -> b (r gpc) (l m n) k", l=1, m=1),
+            opacities=rearrange(batch_opacities, "b r gpc m n -> b (r gpc m n)",m=1,n=1),
+            # NOTE: These aren't yet rotated into world space, but they're only used for
+            # exporting Gaussians to ply files. This needs to be fixed...
+            scales=rearrange(scales, "b r gpc n -> b (r gpc) n"),
+            rotations=rearrange(rotations.broadcast_to((*scales.shape[:-1], 4)), "b r gpc n -> b (r gpc) n"),
+        )
+
+    def get_scale_multiplier(
+        self,
+        intrinsics: Float[Tensor, "*#batch 3 3"],
+        pixel_size: Float[Tensor, "*#batch 2"],
+        multiplier: float = 0.1,
+    ) -> Float[Tensor, " *batch"]:
+        xy_multipliers = multiplier * einsum(
+            intrinsics[..., :2, :2].inverse(),
+            pixel_size,
+            "... i j, j -> ... i",
+        )
+        return xy_multipliers.sum(dim=-1)
+
+    @property
+    def d_sh(self) -> int:
+        return (self.cfg.sh_degree + 1) ** 2
+
+    @property
+    def d_in(self) -> int:
+        return 7 + 3 * self.d_sh

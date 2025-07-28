@@ -18,7 +18,10 @@ from pytorch_lightning.loggers.wandb import WandbLogger
 
 from pytorch_lightning.plugins.environments import LightningEnvironment
 
+# import DDPStrategy from pytorch_lightning
+from pytorch_lightning.strategies import DDPStrategy
 
+torch.autograd.set_detect_anomaly(True)
 
 # Configure beartype and jaxtyping.
 with install_import_hook(
@@ -40,7 +43,6 @@ with install_import_hook(
 
 def cyan(text: str) -> str:
     return f"{Fore.CYAN}{text}{Fore.RESET}"
-
 
 @hydra.main(
     version_base=None,
@@ -135,17 +137,14 @@ def train(cfg_dict: DictConfig):
 
     # This allows the current step to be shared with the data loader processes.
     step_tracker = StepTracker()
-    # step_tracker = None
     print(torch.cuda.device_count(), "GPUs available")
     trainer = Trainer(
         max_epochs=-1,
         accelerator="gpu",
         logger=logger,
         devices=torch.cuda.device_count(),
-        strategy='ddp' if torch.cuda.device_count() > 1 else "auto",
-        # strategy=DDPStrategy(find_unused_parameters=False，
-        #                      cluster_environment=None,  # Default uses Gloo
-        #                      process_group_backend="gloo") if torch.cuda.device_count() > 1 else "auto",
+        # strategy='ddp' if torch.cuda.device_count() > 1 else "auto",
+        strategy=DDPStrategy(find_unused_parameters=True) if torch.cuda.device_count() > 1 else "auto",
         callbacks=callbacks,
         val_check_interval=cfg.trainer.val_check_interval,
         # enable_progress_bar=cfg.mode == "test",
@@ -155,11 +154,11 @@ def train(cfg_dict: DictConfig):
         num_sanity_val_steps=cfg.trainer.num_sanity_val_steps,
         num_nodes=cfg.trainer.num_nodes,
         plugins=LightningEnvironment() if cfg.use_plugins else None,
-        profiler=None
+        profiler=None,
     )
     torch.manual_seed(cfg_dict.seed + trainer.global_rank)
 
-    encoder, encoder_visualizer = get_encoder(cfg.model.encoder)
+    encoder, encoder_visualizer = get_encoder(cfg.model.encoder, gs_cube = cfg.train_controller.gs_cube)
 
     model_wrapper = ModelWrapper(
         cfg.optimizer,
@@ -173,6 +172,7 @@ def train(cfg_dict: DictConfig):
         eval_data_cfg=(
             None if eval_cfg is None else eval_cfg.dataset
         ),
+        train_controller_cfg=cfg.train_controller,
     )
     data_module = DataModule(
         cfg.dataset,
@@ -238,7 +238,7 @@ def train(cfg_dict: DictConfig):
                     f"Loaded pretrained depth: {cfg.checkpointing.pretrained_depth}"
                 )
             )
-            
+         
         trainer.fit(model_wrapper, datamodule=data_module, ckpt_path=checkpoint_path)
     else:
         # load full model

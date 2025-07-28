@@ -39,6 +39,14 @@ class TrainerCfg:
     num_sanity_val_steps: int
     num_nodes: int
 
+@dataclass
+class ModelExtraCfg:
+    gs_cube: bool
+
+@dataclass
+class TrainControllerCfg:
+    gs_cube: bool
+    base_model: bool
 
 @dataclass
 class RootCfg:
@@ -55,6 +63,7 @@ class RootCfg:
     train: TrainCfg
     seed: int
     use_plugins: bool
+    train_controller: TrainControllerCfg
 
 
 TYPE_HOOKS = {
