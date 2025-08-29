@@ -172,5 +172,9 @@ log*
 wandb/
 *.txt
 *.png
+<<<<<<< HEAD
 notes/
 comparisons/
+=======
+gscube*
+>>>>>>> f255503b8e85ffa595e2d98df9c44e0c036204a9

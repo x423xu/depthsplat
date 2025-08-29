@@ -172,6 +172,7 @@ class ModelWrapper(LightningModule):
         if self.test_cfg.compute_scores:
             self.test_step_outputs = {}
             self.time_skip_steps_dict = {"encoder": 0, "decoder": 0}
+        
 
     def training_step(self, batch, batch_idx):
         torch.cuda.empty_cache()
@@ -395,7 +396,6 @@ class ModelWrapper(LightningModule):
 
         if self.global_step == 5 and self.global_rank == 0:
             os.system("nvidia-smi")
-
         return total_loss
     
     def test_step(self, batch, batch_idx):
