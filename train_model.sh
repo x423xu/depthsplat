@@ -1,0 +1,21 @@
+CUDA_VISIBLE_DEVICES=2 nohup python -m src.main +experiment=re10k \
+dataset.roots=[/data0/xxy/data/re10k] \
+data_loader.train.batch_size=2 \
+dataset.test_chunk_interval=100 \
+trainer.max_steps=100000 \
+model.encoder.upsample_factor=4 \
+model.encoder.lowest_feature_resolution=4 \
+model.encoder.gaussians_per_cell=1 \
+model.encoder.cell_scale=2 \
+model.encoder.down_strides=[2,2] \
+model.encoder.cube_encoder_type=large \
+checkpointing.pretrained_model=/data0/xxy/code/depthsplat/checkpoints/re10k-256x256-depthsplat-small/checkpoints/epoch_27-step_300000.ckpt \
+checkpointing.pretrained_monodepth=pretrained/depth_anything_v2_vits.pth \
+checkpointing.pretrained_mvdepth=pretrained/gmflow-scale1-things-e9887eda.pth \
+output_dir=/data2/xxy/code/voxelsplat/checkpoints/gscube-depth22-gpc1-scale2-with-skip-large \
+train_controller.gs_cube=true \
+train_controller.base_model=false \
+trainer.val_check_interval=0.1 \
+optimizer.weight_decay=0.0 \
+optimizer.lr_gs_cube=2e-4 \
+optimizer.lr=1e-7 >gacube_depth22_gpc1_scale2_with_skip_large 2>&1 &

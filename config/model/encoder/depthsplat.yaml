@@ -59,3 +59,4 @@ gs_cube: false
 gaussians_per_cell: 4
 down_strides: [2, 2]
 cell_scale: 1
+cube_encoder_type: large

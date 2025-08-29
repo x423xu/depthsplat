@@ -158,7 +158,9 @@ def train(cfg_dict: DictConfig):
     )
     torch.manual_seed(cfg_dict.seed + trainer.global_rank)
 
-    encoder, encoder_visualizer = get_encoder(cfg.model.encoder, gs_cube = cfg.train_controller.gs_cube)
+    encoder, encoder_visualizer = get_encoder(cfg.model.encoder, 
+                                              gs_cube = cfg.train_controller.gs_cube, 
+                                              vggt_meta = cfg.train_controller.vggt_meta)
 
     model_wrapper = ModelWrapper(
         cfg.optimizer,
@@ -179,6 +181,7 @@ def train(cfg_dict: DictConfig):
         cfg.data_loader,
         step_tracker,
         global_rank=trainer.global_rank,
+        train_controller_cfg=cfg.train_controller,
     )
 
     if cfg.mode == "train":
@@ -202,7 +205,6 @@ def train(cfg_dict: DictConfig):
                     f"Loaded pretrained monodepth: {cfg.checkpointing.pretrained_monodepth}"
                 )
             )
-
         # load pretrained mvdepth
         if cfg.checkpointing.pretrained_mvdepth is not None:
             pretrained_model = torch.load(cfg.checkpointing.pretrained_mvdepth, map_location='cpu')['model']

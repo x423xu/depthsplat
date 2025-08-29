@@ -8,9 +8,11 @@ import torch.nn.functional as F
 from typing import Union
 
 from ....geometry.projection import get_world_rays
+from ....geometry.vggt_geometry import unproject_depth_map_to_point_map
 from ....misc.sh_rotation import rotate_sh
 from .gaussians import build_covariance
 
+DEBUG = False
 
 @dataclass
 class Gaussians:
@@ -59,7 +61,9 @@ class GaussianAdapter(nn.Module):
         eps: float = 1e-8,
         point_cloud: Float[Tensor, "*#batch 3"] | None = None,
         input_images: Tensor | None = None,
+        vggt_meta:bool=False
     ) -> Gaussians:
+            
         scales, rotations, sh = raw_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
 
         scales = torch.clamp(F.softplus(scales - 4.),
@@ -88,8 +92,82 @@ class GaussianAdapter(nn.Module):
         covariances = c2w_rotations @ covariances @ c2w_rotations.transpose(-1, -2)
 
         # Compute Gaussian means.
-        origins, directions = get_world_rays(coordinates, extrinsics, intrinsics)
-        means = origins + directions * depths[..., None]
+        if vggt_meta:
+            means = unproject_depth_map_to_point_map(
+                coordinates = rearrange(coordinates, "b v (h w) l m n -> (b v) h w (l m n)", h=image_shape[0], w=image_shape[1]),
+                depth_map=rearrange(depths, "b v (h w) m n -> (b v) h (w m n)", h=image_shape[0], w=image_shape[1]),
+                extrinsics_cam=rearrange(extrinsics, "b v l m n i j -> (b v l m n) i j").inverse(),
+                intrinsics_cam=rearrange(intrinsics, "b v l m n i j -> (b v l m n) i j")
+            )
+            means = rearrange(means, "(b v) h w c -> b v (h w) () () c", b=extrinsics.shape[0], v=extrinsics.shape[1], h=image_shape[0], w=image_shape[1], c=3)
+        else:        
+            origins, directions = get_world_rays(coordinates, extrinsics, intrinsics)
+            means = origins + directions * depths[..., None]
+        
+        if DEBUG:
+            '''
+            check if world rays are correct
+            '''
+            from PIL import Image
+            import numpy as np
+            import matplotlib.pyplot as plt
+            # from ....geometry.vggt_geometry import unproject_depth_map_to_point_map
+
+            # means2 = unproject_depth_map_to_point_map(
+            #     depth_map = rearrange(depths, "b v (h w) m n -> (b v) h (w m n)", h=image_shape[0], w=image_shape[1]),
+            #     extrinsics_cam=rearrange(extrinsics, "b v l m n i j -> (b v l m n) i j").inverse(),
+            #     intrinsics_cam=rearrange(intrinsics, "b v l m n i j -> (b v l m n) i j")
+            # )
+            # print(means2.shape)
+
+            def render_pcs(points, colors, opacities, num):
+                points = points.squeeze().detach().cpu().numpy()
+                colors = colors.squeeze().detach().cpu().numpy()
+                opacities = opacities.squeeze().detach().cpu().numpy()
+                # Load point cloud
+                fig = plt.figure(figsize=(10, 8))
+                ax = fig.add_subplot(111, projection='3d')
+                ax.scatter(
+                    points[:, 0],  # X-axis
+                    points[:, 2],  # Y-axis
+                    points[:, 1],  # Z-axis
+                    c=colors,      # Color
+                    marker='o',    # Point shape
+                    s=1,           # Point size
+                )
+                # ax.invert_yaxis()
+                ax.invert_zaxis()  
+                fig.savefig(f"point_cloud_{num}.png", dpi=300)
+                plt.close(fig)
+            points = means.squeeze().reshape(-1,3).cpu()
+            # points = means2.reshape(-1, 3)
+            colors = rearrange(input_images[0].squeeze(), "v c h w->(v h w) c")
+            opacities = opacities[0].squeeze()
+            render_pcs(points, colors, opacities, 'adapter')
+            
+            # points = means[0,0].detach().clone().squeeze().cpu()
+            # points = torch.tensor(means[0], dtype=torch.float32)
+            points_homo = torch.cat([points, torch.ones_like(points[..., :1])], dim=-1)
+            P = extrinsics[0].squeeze().cpu()[0]
+            K = intrinsics[0].squeeze().cpu()[0]
+            points_cam = points_homo@P.inverse().T
+            points_img = points_cam[..., :3]@K.T
+            points_img = points_img / points_img[..., -1:]
+            points_img = points_img[..., :2]
+            coods_xy = points_img[...,:2].cpu().numpy().astype(np.uint16)
+            colors = colors.detach().cpu().numpy()
+            new_img = np.zeros(shape=(256,256,3))
+            for i in range(len(coods_xy)):
+                x, y = coods_xy[i]
+                x = min(x, 255)
+                y = min(y, 255)
+                new_img[y,x] = colors[i]
+            img = Image.fromarray((new_img * 255).astype(np.uint8))
+            img.save('reproject_before.png')
+
+            raise ValueError("Debugging GaussianAdapter, check point cloud rendering")
+            
+            
 
         return Gaussians(
             means=means,
@@ -362,6 +440,8 @@ class DenseGaussianAdapter(nn.Module):
     ) -> Gaussians:
         
         assert input_images is not None
+
+        # coordinates  =coordinates + 0.1* torch.randn_like(coordinates)  # add noise to coordinates
 
         batch_feats = []
         batch_opacities = []

@@ -47,6 +47,8 @@ class ModelExtraCfg:
 class TrainControllerCfg:
     gs_cube: bool
     base_model: bool
+    vggt_meta: bool
+    backbone: list[str]
 
 @dataclass
 class RootCfg:

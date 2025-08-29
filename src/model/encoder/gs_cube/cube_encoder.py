@@ -8,8 +8,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from Swin3D.models import Swin3DUNet
 from ....geometry.projection import get_world_rays
+from ....geometry.vggt_geometry import unproject_depth_map_to_point_map
 from ....geometry.projection import sample_image_grid
-from einops import rearrange
+from einops import rearrange, repeat
 import MinkowskiEngine as ME
 from torch_scatter import scatter_max
 from Swin3D.modules.mink_layers import assign_feats
@@ -114,7 +115,7 @@ class GSCubeEncoder(Swin3DUNet):
         #         nn.GELU(),
         #         nn.Linear(num_gaussian_parameters, num_gaussian_parameters)
         #     )
-        self.gs_cube_head = GSCubeHead(inchannels=48, num_gaussian_parameters=num_gaussian_parameters, gpc = gpc)
+        self.gs_cube_head = GSCubeHead(inchannels=channels[0], num_gaussian_parameters=num_gaussian_parameters, gpc = gpc)
         self.gpc = gpc
         self.cell_scale = cell_scale
 
@@ -158,7 +159,7 @@ class GSCubeEncoder(Swin3DUNet):
             coords_sp = coords_sp_i
 
         # output = self.classifier(sp.F)
-        return sp
+        return sp, coords_sp
 
     # def forward(self, sp, coords_sp):
         
@@ -173,7 +174,8 @@ class GSCubeEncoder(Swin3DUNet):
                 depth_min=0.5,
                 depth_max=100.0,
                 num_depth=128,
-                return_perview=False):
+                return_perview=False,
+                vggt_meta=False):
         '''
         imgs: context images, shape: BxVxCxHxW, range: [0, 1]
         depth: depth map, shape: BxVxHxW
@@ -182,35 +184,49 @@ class GSCubeEncoder(Swin3DUNet):
         # s1: get world coordinates from depth
         b,v,_,h,w = imgs.shape
         device = imgs.device
-        xy_ray, _ = sample_image_grid((h, w), device)
-        xy_ray = torch.broadcast_to(xy_ray, (b, v, h, w, 2))
-        origins, directions = get_world_rays(
-            rearrange(xy_ray,"b v h w xy->(b v) (h w) xy"), 
-            rearrange(extrinsics,"b v h w->(b v) () h w"), 
-            rearrange(intrinsics,"b v h w->(b v) () h w"))
-        depth = rearrange(depth, "b v h w->(b v) (h w)")
-        xyz_world = origins + directions * depth[..., None] # bv, hw, 3
+        if vggt_meta:
+            _, coordinates = sample_image_grid((h, w), device)
+            xyz_world = unproject_depth_map_to_point_map(
+                coordinates = repeat(coordinates.float(), "h w c -> (b v) h w c", b=b, v=v),
+                depth_map=rearrange(depth, "b v h w -> (b v) h w", h=h, w=w),
+                extrinsics_cam=rearrange(extrinsics, "b v i j -> (b v) i j").inverse(),
+                intrinsics_cam=rearrange(intrinsics, "b v i j -> (b v) i j")
+            )
+            xyz_world = rearrange(xyz_world, "(b v) h w c -> (b v) (h w) c", b=b, v=v, h=h, w=w, c=3)
+        else:
+            xy_ray, _ = sample_image_grid((h, w), device)
+            xy_ray = torch.broadcast_to(xy_ray, (b, v, h, w, 2))
+            origins, directions = get_world_rays(
+                rearrange(xy_ray,"b v h w xy->(b v) (h w) xy"), 
+                rearrange(extrinsics,"b v h w->(b v) () h w"), 
+                rearrange(intrinsics,"b v h w->(b v) () h w"))
+            depth = rearrange(depth, "b v h w->(b v) (h w)")
+            xyz_world = origins + directions * depth[..., None] # bv, hw, 3
         # s2: voxelization, each cell contains at most one point
         gs_cube_input, gs_cube_input_perview = self.voxelize(xyz_world, 
                       rearrange(feats,"b v l h w -> b (v h w) l"), 
                       rearrange(imgs,"b v c h w -> b (v h w) c"), 
                       num_depth, b=b, v=v, h=h, w=w, return_perview=return_perview)
+        # gs_cube_input, gs_cube_input_perview = self.extensible_voxelization(xyz_world, 
+        #               rearrange(feats,"b v l h w -> b (v h w) l"), 
+        #               rearrange(imgs,"b v c h w -> b (v h w) c"), 
+        #               num_depth, b=b, v=v, h=h, w=w, return_perview=return_perview)
         # s3: encode
         sp_stack, coords_sp_stack, nog_min = self.encode(gs_cube_input.sp, gs_cube_input.coords_sp)
         # s4: decode
-        sp = self.decode(sp_stack, coords_sp_stack)
+        sp, coords_sp = self.decode(sp_stack, coords_sp_stack)
         spf = self.gs_cube_head(sp.F)  # [N, KxC]
         sp = assign_feats(sp, spf)
         nog_pb = self.gpc*sp.C.shape[0]//b
         # nog_pv = self.gpc*sp.C.shape[0]//(b * v)
         nog_min = nog_min // b
         if return_perview:
-            return sp, gs_cube_input, gs_cube_input_perview, nog_pb, nog_min
-        return sp, gs_cube_input, None, nog_pb, nog_min
+            return sp, coords_sp, gs_cube_input, gs_cube_input_perview, nog_pb, nog_min
+        return sp, coords_sp,gs_cube_input, None, nog_pb, nog_min
 
     def voxelize(self, xyz_world, feats, imgs, num_depth, b=None, v=None, h=None, w=None, return_perview=False):
         '''
-        some notations about intermidiate variables:
+        some notes about intermidiate variables:
         xyz_world: world coordinates, shape: (b, v*h*w, 3), range: physical distances
         xyz_nomralized: normalized coordinates, shape: (b, v*h*w, 3), range: [0, 1]
         xyz_scaled: true positions in a 3D mesh grid that is a float type, shape: (b, v*h*w, 3)
@@ -227,7 +243,7 @@ class GSCubeEncoder(Swin3DUNet):
         xyz_world = rearrange(xyz_world, "(b v) (h w) xyz -> b (v h w) xyz", b=b, v=v, h=h, w=w)
         xyz_min = xyz_world.min(dim=1, keepdim=True)[0]
         xyz_max = xyz_world.max(dim=1, keepdim=True)[0]
-        assert (xyz_max > xyz_min).all(), "xyz_max should be larger than xyz_min"
+        assert (xyz_max > xyz_min).all(), "xyz_max should be larger than xyz_min. now xyz_min: {}, xyz_max: {}".format(xyz_min, xyz_max)
         xyz_normalized = (xyz_world - xyz_min) / (xyz_max - xyz_min)
         # we should have hxwxnum_depth grid cells
         grid_shape = torch.tensor([h, w, num_depth], dtype=torch.float32, device=device)
@@ -237,18 +253,22 @@ class GSCubeEncoder(Swin3DUNet):
         # cell ind:0 -> h-1, 0->w-1, 0->num_depth-1
         xyz_scaled = xyz_normalized * (grid_shape-1e-4)
         grid_coords = torch.floor(xyz_scaled).long()
+        # gradient_placeholder = xyz_scaled-xyz_scaled.detach()
 
         '''get grid_coords per view'''
-        view_ind = torch.cat([torch.full((b, h*w, 1), view) for view in range(v)], dim=1).to(device) # b (v h w) 1
-        grid_coords_view = torch.cat([grid_coords, view_ind], dim=-1)  # b (v h w) 4
+        if return_perview:
+            view_ind = torch.cat([torch.full((b, h*w, 1), view) for view in range(v)], dim=1).to(device) # b (v h w) 1
+            grid_coords_view = torch.cat([grid_coords, view_ind], dim=-1)  # b (v h w) 4
+            position_all_views = []
+            coords_all_views = []
+            feats_all_views = []
 
         '''get per batch and per view sparse tensors'''
         batch_positions =  []
         batch_coords_centers = []
         batch_feats = []
-        position_all_views = []
-        coords_all_views = []
-        feats_all_views = []
+
+        
         for batch_idx in range(xyz_world.shape[0]):  
             '''randomly select one within each voxel'''
             # Ensure each cell has at most one point
@@ -344,7 +364,202 @@ class GSCubeEncoder(Swin3DUNet):
                     )
             return gs_cube_tensor, gs_cube_tensor_bv
         return gs_cube_tensor, None
+    def extensible_voxelization(self, xyz_world, feats, imgs, num_depth, b=None, v=None, h=None, w=None, return_perview=False):
+        '''
+        compared with plain voxelization, this function can handle unknown input number of views
+        ''' 
+        
+        if v>=2:
+            device = xyz_world.device 
+            grid_shape = torch.tensor([h, w, num_depth], dtype=torch.float32, device=device)
+            grid_shape = grid_shape*self.cell_scale
+            imgs_reshape = rearrange(imgs, "b (v h w) c -> b v (h w) c", b=b, v=v, h=h, w=w)
+            xyz_world_reshape = rearrange(xyz_world, "(b v) (h w) xyz -> b v (h w) xyz", b=b, v=v, h=h, w=w)
+            feats_reshape = rearrange(feats, "b (v h w) l -> b v (h w) l", b=b, v=v, h=h, w=w)
 
+            xyz_world_anchor = xyz_world_reshape[:, :2, :, :]  # use the first 2 views as the anchor
+            imgs_anchor = imgs_reshape[:, :2, :, :]  # use the first 2 views as the anchor
+            feats_anchor  = feats_reshape[:, :2, :, :]
+            xyz_world_anchor = rearrange(xyz_world_anchor, "b v (h w) xyz -> b (v h w) xyz", b=b, v=2, h=h, w=w)
+            imgs_anchor = rearrange(imgs_anchor, "b v (h w) c -> b (v h w) c", b=b, v=2, h=h, w=w)
+            feats_anchor = rearrange(feats_anchor, "b v (h w) l -> b (v h w) l", b=b, v=2, h=h, w=w)
+
+            
+            xyz_world_rest = xyz_world_reshape[:, 2:, :, :]  # the rest views
+            imgs_rest = imgs_reshape[:, 2:, :, :]
+            feats_rest = feats_reshape[:, 2:, :, :]
+            xyz_world_rest = rearrange(xyz_world_rest, "b v (h w) xyz -> b (v h w) xyz", b=b, v=v-2, h=h, w=w)
+            imgs_rest = rearrange(imgs_rest, "b v (h w) c -> b (v h w) c", b=b, v=v-2, h=h, w=w)
+            feats_rest = rearrange(feats_rest, "b v (h w) l -> b (v h w) l", b=b, v=v-2, h=h, w=w)
+
+            '''get grid_coords per batch'''
+           
+            xyz_min = xyz_world_anchor.min(dim=1, keepdim=True)[0]
+            xyz_max = xyz_world_anchor.max(dim=1, keepdim=True)[0]
+            cell_sizes = (xyz_max - xyz_min) / grid_shape
+            cell_sizes = cell_sizes.squeeze(1) 
+            assert (xyz_max > xyz_min).all(), "xyz_max should be larger than xyz_min"
+    
+            xyz_world_rest_normalized = (xyz_world_rest - xyz_min) / (xyz_max - xyz_min)
+            xyz_world_anchor_normalized = (xyz_world_anchor - xyz_min) / (xyz_max - xyz_min)
+            # remove overlapping points
+            xyz_world_rest_scaled = xyz_world_rest_normalized * (grid_shape-1e-4)
+            xyz_world_anchor_scaled = xyz_world_anchor_normalized * (grid_shape-1e-4)
+            xyz_world_rest_coords = torch.floor(xyz_world_rest_scaled).long()
+            xyz_world_anchor_coords = torch.floor(xyz_world_anchor_scaled).long()
+
+            xyz_non_overlap = []
+            xyz_non_overlap_scaled = []
+            imgs_non_overlap = []
+            feats_non_overlap = []
+            
+            for bi in range(xyz_world_rest_coords.shape[0]):
+                xyz_b = []
+                xyz_scaled_b = []
+                imgs_b = []
+                feats_b = []
+                for ni in range(xyz_world_rest_coords.shape[1]):
+                    match = torch.where((xyz_world_anchor_coords[bi]-xyz_world_rest_coords[bi, ni]).sum(-1) == 0)[0]
+                    if not match.any():
+                        xyz_b.append(xyz_world_rest_coords[bi, ni])
+                        xyz_scaled_b.append(xyz_world_rest_scaled[bi, ni])
+                        imgs_b.append(imgs_rest[bi, ni])
+                        feats_b.append(feats_rest[bi, ni])
+                if len(xyz_b) > 0:
+                    xyz_non_overlap.append(torch.stack(xyz_b, dim=0))
+                    xyz_non_overlap_scaled.append(torch.stack(xyz_scaled_b, dim=0))
+                    imgs_non_overlap.append(torch.stack(imgs_b, dim=0))
+                    feats_non_overlap.append(torch.stack(feats_b, dim=0))
+                    print("batch {} has {} non-overlapping points".format(bi, len(xyz_b)))
+            if len(xyz_non_overlap) > 0:
+                xyz_world_rest_coords = torch.stack(xyz_non_overlap, dim=0)
+                xyz_world_rest_scaled = torch.stack(xyz_non_overlap_scaled, dim=0)
+                imgs_rest = torch.stack(imgs_non_overlap, dim=0)
+                feats_rest = torch.stack(feats_non_overlap, dim=0)
+                print(xyz_world_rest_coords.shape[1], "non-overlapping points in the rest views")
+            
+            
+            # cell ind:0 -> h-1, 0->w-1, 0->num_depth-1
+            xyz_scaled = torch.cat([xyz_world_anchor_scaled, xyz_world_rest_scaled], dim=1)  # b (v h w) xyz
+            grid_coords = torch.cat([xyz_world_anchor_coords, xyz_world_rest_coords], dim=1)  # b (v h w) xyz
+            imgs = torch.cat([imgs_anchor, imgs_rest], dim=1)  # b (v h w) c
+            feats = torch.cat([feats_anchor, feats_rest], dim=1)  #
+            # xyz_scaled = xyz_world_anchor_scaled
+            # grid_coords = xyz_world_anchor_coords
+            # imgs = imgs_anchor
+            # feats = feats_anchor
+            '''get grid_coords per view'''
+            if return_perview:
+                view_ind = torch.cat([torch.full((b, h*w, 1), view) for view in range(v)], dim=1).to(device) # b (v h w) 1
+                grid_coords_view = torch.cat([grid_coords, view_ind], dim=-1)  # b (v h w) 4
+                position_all_views = []
+                coords_all_views = []
+                feats_all_views = []
+
+            '''get per batch and per view sparse tensors'''
+            batch_positions =  []
+            batch_coords_centers = []
+            batch_feats = []
+            
+            for batch_idx in range(xyz_world_anchor.shape[0]):  
+                '''randomly select one within each voxel'''
+                # Ensure each cell has at most one point
+                unique_coords, inverse_ind = torch.unique(
+                    grid_coords[batch_idx,:,:], 
+                    dim=0, 
+                    return_inverse=True, 
+                    return_counts=False, 
+                    sorted=False
+                )
+                # randomly select one point in each voxel by choosing the max random value
+                rand_val = torch.rand(grid_coords[batch_idx,:,:].size(0), device=device)
+                _, selected_ind = scatter_max(
+                    rand_val,
+                    inverse_ind,
+                    dim=0,
+                    dim_size=unique_coords.shape[0]
+                )
+                unique_grid_coords = grid_coords[batch_idx,selected_ind,:]
+                feats_unique = feats[batch_idx, selected_ind, :]
+                imgs_unique = imgs[batch_idx, selected_ind, :]
+                positions = xyz_scaled[batch_idx, selected_ind, :]
+                # concatenate the batch index with coords
+                coords_centers = torch.cat([torch.full((unique_grid_coords.shape[0], 1), batch_idx).to(device), unique_grid_coords], dim=-1)  # Nx4
+                positions = torch.cat([torch.full((positions.shape[0], 1), batch_idx).to(device), positions, imgs_unique], dim=-1)  # Nx7
+                batch_coords_centers.append(coords_centers)
+                batch_positions.append(positions)    
+                batch_feats.append(feats_unique)
+
+                if return_perview:
+                    ''' the same process for each view'''
+                    unique_coords_view, inverse_ind_view = torch.unique(
+                        grid_coords_view[batch_idx,:,:], 
+                        dim=0, 
+                        return_inverse=True, 
+                        return_counts=False, 
+                        sorted=False
+                    )
+                    rand_val_view = torch.rand(grid_coords_view[batch_idx,:,:].size(0), device=device)
+                    _, selected_ind_view = scatter_max(
+                        rand_val_view,
+                        inverse_ind_view,
+                        dim=0,
+                        dim_size=unique_coords_view.shape[0]
+                    )
+                    unique_grid_coords_view = grid_coords_view[batch_idx,selected_ind_view,:]
+                    feats_unique_view = feats[batch_idx, selected_ind_view, :]
+                    imgs_unique_view = imgs[batch_idx, selected_ind_view, :]
+                    positions_view = xyz_scaled[batch_idx, selected_ind_view, :]
+                    # concatenate the batch index with coords
+                    coords_centers_view = torch.cat([torch.full((unique_grid_coords_view.shape[0], 1), batch_idx).to(device), unique_grid_coords_view], dim=-1)  # Nx4
+                    positions_view = torch.cat([torch.full((positions_view.shape[0], 1), batch_idx).to(device), positions_view, imgs_unique_view], dim=-1)
+                    coords_per_view = []
+                    position_per_view = []
+                    feats_per_view = []
+                    for view_id in range(v):
+                        ind = torch.where(coords_centers_view[:,4] == view_id)[0]
+                        coords_per_view.append(coords_centers_view[ind,:4])  # Nx4
+                        position_per_view.append(positions_view[ind,:])  # Nx7
+                        feats_per_view.append(feats_unique_view[ind,:])  # NxC
+                    coords_all_views.append(coords_per_view)
+                    position_all_views.append(position_per_view)
+                    feats_all_views.append(feats_per_view)
+            # stack the coords
+            batch_coords_centers = torch.cat(batch_coords_centers, dim=0)  # [N,4]
+            batch_positions = torch.cat(batch_positions, dim=0)  # [N, 4]     
+            batch_feats = torch.cat(batch_feats, dim=0)  # [N, C]
+            
+            gs_cube_tensor = GSCubeInput(
+                feats=batch_feats, 
+                coords_centers=batch_coords_centers, 
+                positions=batch_positions, 
+                imgs=None,
+                cell_sizes=cell_sizes,
+                xyz_min=xyz_min,
+                xyz_max=xyz_max,
+                device=device
+            )
+            if return_perview:
+                gs_cube_tensor_bv = {}
+                for batch_idx in range(b):
+                    gs_cube_tensor_bv[batch_idx] = {}
+                    for view_id in range(v):
+                        gs_cube_tensor_bv[batch_idx][view_id] = GSCubeInput(
+                            feats=feats_all_views[batch_idx][view_id], 
+                            coords_centers=coords_all_views[batch_idx][view_id], 
+                            positions=position_all_views[batch_idx][view_id], 
+                            imgs=None,
+                            cell_sizes=cell_sizes,
+                            xyz_min=xyz_min[batch_idx:batch_idx+1],
+                            xyz_max=xyz_max[batch_idx:batch_idx+1],
+                            device=device
+                        )
+                return gs_cube_tensor, gs_cube_tensor_bv
+            return gs_cube_tensor, None
+
+        else:
+            # if v <= 2, we can use the plain voxelization
+            return self.voxelize(xyz_world, feats, imgs, num_depth, b=b, v=v, h=h, w=w, return_perview=return_perview)
 
 if __name__ == "__main__":
     import MinkowskiEngine as ME

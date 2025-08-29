@@ -18,6 +18,7 @@ import time
 from tqdm import tqdm
 import torch.nn.functional as F
 import math
+from PIL import Image as PILImage
 
 from ..dataset.data_module import get_data_shim
 from ..dataset.types import BatchedExample
@@ -47,8 +48,10 @@ from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 from src.visualization.vis_depth import viz_depth_tensor
 from PIL import Image
 from ..misc.stablize_camera import render_stabilization_path
-from .ply_export import save_gaussian_ply
+from .ply_export import save_gaussian_ply, save_gaussian_cube_ply
 
+
+DEBUG = False
 
 @dataclass
 class OptimizerCfg:
@@ -56,6 +59,7 @@ class OptimizerCfg:
     warm_up_steps: int
     lr_monodepth: float
     weight_decay: float
+    lr_gs_cube: float
 
 
 @dataclass
@@ -147,8 +151,13 @@ class ModelWrapper(LightningModule):
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
 
+        # for name, param in self.encoder.named_parameters():
+        #     if "depth_predictor" in name:
+        #         param.requires_grad = False
+
         # when training the gscube, the base_model is freezed
         self.gs_cube = train_controller_cfg.gs_cube if train_controller_cfg else False
+        self.vggt_meta = train_controller_cfg.vggt_meta if train_controller_cfg else False
         if not train_controller_cfg.base_model:
             for name, param in self.encoder.named_parameters():
                 if not "gs_cube_encoder" in name:
@@ -165,6 +174,11 @@ class ModelWrapper(LightningModule):
             self.time_skip_steps_dict = {"encoder": 0, "decoder": 0}
 
     def training_step(self, batch, batch_idx):
+        torch.cuda.empty_cache()
+        # reserved = torch.cuda.memory_reserved() / 1e9  # Total managed by PyTorch  
+        # allocated = torch.cuda.memory_allocated() / 1e9  # Active tensor usage  
+        # print(f"\nReserved memory: {reserved:.2f} GB, Allocated memory: {allocated:.2f} GB")
+        # print(torch.cuda.memory_summary())  
         batch: BatchedExample = self.data_shim(batch)
         _, _, _, h, w = batch["target"]["image"].shape
 
@@ -214,6 +228,7 @@ class ModelWrapper(LightningModule):
                 target_far,
                 (h, w),
                 depth_mode=self.train_cfg.depth_mode,
+                scale_invariant = not self.vggt_meta
             )
             # split
             batch_size = batch["target"]["extrinsics"].size(0)
@@ -244,6 +259,7 @@ class ModelWrapper(LightningModule):
                 batch["target"]["far"],
                 (h, w),
                 depth_mode=self.train_cfg.depth_mode,
+                vggt_meta=self.vggt_meta
             )
 
         target_gt = batch["target"]["image"]
@@ -253,7 +269,7 @@ class ModelWrapper(LightningModule):
             rearrange(target_gt, "b v c h w -> (b v) c h w"),
             rearrange(output.color, "b v c h w -> (b v) c h w"),
         )
-        self.log("train/psnr", psnr_probabilistic.mean())
+        self.log("train/psnr", psnr_probabilistic.mean(), prog_bar=True)
 
         # Compute and log loss.
         total_loss = 0
@@ -279,7 +295,7 @@ class ModelWrapper(LightningModule):
                     self.global_step,
                     valid_depth_mask=valid_depth_mask,
                 )
-            self.log(f"loss/{loss_fn.name}", loss)
+            self.log(f"loss/{loss_fn.name}", loss, prog_bar=True)
             total_loss = total_loss + loss
 
         # color loss on intermediate output
@@ -353,7 +369,7 @@ class ModelWrapper(LightningModule):
                         total_loss + self.train_cfg.intermediate_loss_weight * loss
                     )
 
-        self.log("loss/total", total_loss)
+        self.log("loss/total", total_loss, prog_bar=True)
 
         if (
             self.global_rank == 0
@@ -383,11 +399,15 @@ class ModelWrapper(LightningModule):
         return total_loss
     
     def test_step(self, batch, batch_idx):
+        torch.cuda.empty_cache()
         batch: BatchedExample = self.data_shim(batch)
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
 
         pred_depths = None
+
+        # print('num_of_ctx_views', batch['context']['image'].shape[1])
+        # print('num_of_tgt_views', batch['target']['image'].shape[1])
 
         # save input views for visualization
         if self.test_cfg.save_input_images:
@@ -408,6 +428,7 @@ class ModelWrapper(LightningModule):
 
         # Render Gaussians.
         with self.benchmarker.time("encoder"):
+            # batch["context"]["extrinsics"] = batch["context"]["extrinsics"] + 0.01*torch.rand_like(batch["context"]["extrinsics"])
             gaussians = self.encoder(
                 batch["context"],
                 self.global_step,
@@ -421,11 +442,28 @@ class ModelWrapper(LightningModule):
                     depth_gt = batch["context"]["depth"]
                 gaussians = gaussians["gaussians"]
 
+        # trim large scales for gscube
+        # if self.gs_cube:
+        #     scales = visualization_dump["cube_scales"]
+        #     max_scale = torch.max(scales[0], dim=-1)[0]  # [V]
+        #     selected_ind = torch.where(max_scale < 1.5)[0]
+        #     gaussians.means = gaussians.means[:,selected_ind]
+        #     gaussians.covariances = gaussians.covariances[:,selected_ind]
+        #     gaussians.harmonics = gaussians.harmonics[:,selected_ind]
+        #     gaussians.opacities = gaussians.opacities[:,selected_ind]
+        #     visualization_dump["cube_scales"] = visualization_dump["cube_scales"][:,selected_ind]
+        #     visualization_dump["cube_rotations"] = visualization_dump["cube_rotations"][:,selected_ind]
+
         # save gaussians
-        if self.test_cfg.save_gaussian:
-            scene = batch["scene"][0]
-            save_path = Path(get_cfg()['output_dir']) / 'gaussians' / (scene + '.ply')
-            save_gaussian_ply(gaussians, visualization_dump, batch, save_path)
+        if self.test_cfg.save_gaussian: 
+            if self.gs_cube:
+                scene = batch["scene"][0]
+                save_path = Path(get_cfg()['output_dir']) / 'gaussians_cube' / (scene + f'_{self.global_step}' + '.ply')
+                save_gaussian_cube_ply(gaussians, visualization_dump, batch, save_path)
+            else:
+                scene = batch["scene"][0]
+                save_path = Path(get_cfg()['output_dir']) / 'gaussians' / (scene + '.ply')
+                save_gaussian_ply(gaussians, visualization_dump, batch, save_path)
 
         if not self.train_cfg.forward_depth_only:
             with self.benchmarker.time("decoder", num_calls=v):
@@ -472,6 +510,7 @@ class ModelWrapper(LightningModule):
                             render_far[:, start:end],
                             (h, w),
                             depth_mode=None,
+                            vggt_meta=self.vggt_meta
                         )
 
                         if i == 0:
@@ -491,6 +530,7 @@ class ModelWrapper(LightningModule):
                         batch["target"]["far"],
                         (h, w),
                         depth_mode=None,
+                        vggt_meta=self.vggt_meta
                     )
 
         (scene,) = batch["scene"]
@@ -631,6 +671,60 @@ class ModelWrapper(LightningModule):
 
     @rank_zero_only
     def validation_step(self, batch, batch_idx):
+        if DEBUG:
+            from PIL import Image
+            import numpy as np
+            import matplotlib.pyplot as plt
+            from ..geometry.vggt_geometry import unproject_depth_map_to_point_map
+
+            def render_pcs(points, colors, opacities, num):
+                points = points.squeeze().detach().cpu().numpy()
+                colors = colors.squeeze().detach().cpu().numpy()
+                opacities = opacities.squeeze().detach().cpu().numpy()
+                # Load point cloud
+                fig = plt.figure(figsize=(10, 8))
+                ax = fig.add_subplot(111, projection='3d')
+                ax.scatter(
+                    points[:, 0],  # X-axis
+                    points[:, 2],  # Y-axis
+                    points[:, 1],  # Z-axis
+                    c=colors,      # Color
+                    marker='o',    # Point shape
+                    s=1,           # Point size
+                )
+                # ax.invert_yaxis()
+                ax.invert_zaxis()  
+                fig.savefig(f"point_cloud_{num}.png", dpi=300)
+                plt.close(fig)
+
+            images = batch['context']['image']
+            depth = batch['context']['depth']
+            extrinsic = batch['context']['extrinsics'].inverse()
+            intrinsic = batch['context']['intrinsics']
+            indices = [torch.arange(length) for length in depth.shape[-2:]]
+            coordinates = torch.stack(torch.meshgrid(*indices, indexing="ij"), dim=-1).to(depth)
+            b,v = depth.shape[:2]
+            depth = rearrange(depth, "b v h w -> (b v) h w")
+            extrinsic = rearrange(extrinsic, "b v c d -> (b v) c d")
+            intrinsic = rearrange(intrinsic, "b v c d -> (b v) c d")
+            coordinates = repeat(coordinates, "h w c-> n h w c", n=b*v)
+            images = rearrange(images, "b v c h w -> (b v) h w c")
+            points = unproject_depth_map_to_point_map(
+                coordinates=coordinates,
+                depth_map=depth,
+                extrinsics_cam=extrinsic,
+                intrinsics_cam=intrinsic
+            )
+            points = points.reshape(-1,3).cpu()
+            # points = means2.reshape(-1, 3)
+            colors = images.reshape(-1,3).cpu()
+            opacities = torch.zeros_like(colors).cpu()  # Opacity is not used in this case
+            render_pcs(points, colors, opacities, 'after_data_shim')
+
+
+
+        torch.cuda.empty_cache()
+        save_interval = 1000
         batch: BatchedExample = self.data_shim(batch)
 
         if self.global_rank == 0:
@@ -643,11 +737,20 @@ class ModelWrapper(LightningModule):
         # Render Gaussians.
         b, _, _, h, w = batch["target"]["image"].shape
         assert b == 1
-        gaussians_softmax = self.encoder(
-            batch["context"],
-            self.global_step,
-            deterministic=False,
-        )
+        if self.global_step % save_interval == 0 and self.global_rank == 0 and batch_idx==0:
+            visualization_dump = {}
+            gaussians_softmax = self.encoder(
+                batch["context"],
+                self.global_step,
+                deterministic=False,
+                visualization_dump=visualization_dump,
+            )
+        else:
+            gaussians_softmax = self.encoder(
+                batch["context"],
+                self.global_step,
+                deterministic=False,
+            )
 
         pred_depths = None
 
@@ -665,7 +768,18 @@ class ModelWrapper(LightningModule):
                 batch["target"]["near"],
                 batch["target"]["far"],
                 (h, w),
+                vggt_meta = self.vggt_meta,
             )
+            # output_softmax = self.decoder.forward(
+            #     gaussians_softmax,
+            #     batch["context"]["extrinsics"],
+            #     batch["context"]["intrinsics"],
+            #     batch["context"]["near"],
+            #     batch["context"]["far"],
+            #     (h, w),
+            #     vggt_meta = self.vggt_meta,
+            #     scale_invariant = True
+            # )
             rgb_softmax = output_softmax.color[0]
 
             # Compute validation metrics.
@@ -691,8 +805,10 @@ class ModelWrapper(LightningModule):
                     mode="bilinear",
                     align_corners=True,
                 ).squeeze(1)
-
-            inverse_depth_pred = 1.0 / pred_depths
+            if self.vggt_meta:
+                inverse_depth_pred = 1.0/ pred_depths
+            else:
+                inverse_depth_pred = 1.0 / pred_depths
 
             concat = []
             for i in range(inverse_depth_pred.size(0)):
@@ -731,6 +847,8 @@ class ModelWrapper(LightningModule):
                 step=self.global_step,
                 caption=batch["scene"],
             )
+            pil_img = PILImage.fromarray(prep_image(add_border(comparison)))
+            pil_img.save("comparisons/{}.png".format(self.global_step))
 
             if not self.train_cfg.no_log_projections:
                 # Render projections and construct projection image.
@@ -761,10 +879,18 @@ class ModelWrapper(LightningModule):
 
             # Run video validation step.
             if not self.train_cfg.no_viz_video:
-                self.render_video_interpolation(batch)
-                self.render_video_wobble(batch)
+                self.render_video_interpolation(batch, vggt_meta=self.vggt_meta)
+                self.render_video_wobble(batch, vggt_meta=self.vggt_meta)
                 if self.train_cfg.extended_visualization:
-                    self.render_video_interpolation_exaggerated(batch)
+                    self.render_video_interpolation_exaggerated(batch, vggt_meta=self.vggt_meta)
+
+        if self.global_step % save_interval == 0 and self.global_rank == 0 and batch_idx==0:
+            if self.gs_cube:
+                print(f"Saving Gaussian cube at step {self.global_step}...")
+                scene = batch["scene"][0]
+                save_path = Path(get_cfg()['output_dir']) / 'gaussians_cube' / (scene + f'_{self.global_step}' + '.ply')
+                save_gaussian_cube_ply(gaussians_softmax, visualization_dump, batch, save_path)
+                visualization_dump = None
 
     def on_validation_epoch_end(self) -> None:
         """hack to run the full validation"""
@@ -872,6 +998,7 @@ class ModelWrapper(LightningModule):
                         batch["target"]["near"],
                         batch["target"]["far"],
                         (h, w),
+                        vggt_meta=self.vggt_meta,
                     )
                 rgbs = [output_probabilistic.color[0]]
                 tags = ["probabilistic"]
@@ -889,6 +1016,7 @@ class ModelWrapper(LightningModule):
                         batch["target"]["near"],
                         batch["target"]["far"],
                         (h, w),
+                        vggt_meta=self.vggt_meta,
                     )
                     rgbs.append(output_deterministic.color[0])
                     tags.append("deterministic")
@@ -924,7 +1052,7 @@ class ModelWrapper(LightningModule):
         self.log("test/runtime_all", overall_eval_time)
 
     @rank_zero_only
-    def render_video_wobble(self, batch: BatchedExample) -> None:
+    def render_video_wobble(self, batch: BatchedExample, vggt_meta=False) -> None:
         # Two views are needed to get the wobble radius.
         _, v, _, _ = batch["context"]["extrinsics"].shape
         if v != 2:
@@ -946,10 +1074,10 @@ class ModelWrapper(LightningModule):
             )
             return extrinsics, intrinsics
 
-        return self.render_video_generic(batch, trajectory_fn, "wobble", num_frames=60)
+        return self.render_video_generic(batch, trajectory_fn, "wobble", num_frames=60, vggt_meta=vggt_meta)
 
     @rank_zero_only
-    def render_video_interpolation(self, batch: BatchedExample) -> None:
+    def render_video_interpolation(self, batch: BatchedExample, vggt_meta=False) -> None:
         _, v, _, _ = batch["context"]["extrinsics"].shape
 
         def trajectory_fn(t):
@@ -973,10 +1101,10 @@ class ModelWrapper(LightningModule):
             )
             return extrinsics[None], intrinsics[None]
 
-        return self.render_video_generic(batch, trajectory_fn, "rgb")
+        return self.render_video_generic(batch, trajectory_fn, "rgb", vggt_meta=vggt_meta)
 
     @rank_zero_only
-    def render_video_interpolation_exaggerated(self, batch: BatchedExample) -> None:
+    def render_video_interpolation_exaggerated(self, batch: BatchedExample, vggt_meta=False) -> None:
         # Two views are needed to get the wobble radius.
         _, v, _, _ = batch["context"]["extrinsics"].shape
         if v != 2:
@@ -1019,6 +1147,7 @@ class ModelWrapper(LightningModule):
             num_frames=300,
             smooth=False,
             loop_reverse=False,
+            vggt_meta=vggt_meta,
         )
 
     @rank_zero_only
@@ -1030,6 +1159,7 @@ class ModelWrapper(LightningModule):
         num_frames: int = 30,
         smooth: bool = True,
         loop_reverse: bool = True,
+        vggt_meta: bool = False
     ) -> None:
         # Render probabilistic estimate of scene.
         gaussians_prob = self.encoder(batch["context"], self.global_step, False)
@@ -1057,7 +1187,7 @@ class ModelWrapper(LightningModule):
         near = repeat(batch["context"]["near"][:, 0], "b -> b v", v=num_frames)
         far = repeat(batch["context"]["far"][:, 0], "b -> b v", v=num_frames)
         output_prob = self.decoder.forward(
-            gaussians_prob, extrinsics, intrinsics, near, far, (h, w), "depth"
+            gaussians_prob, extrinsics, intrinsics, near, far, (h, w), "depth", vggt_meta=vggt_meta
         )
         images_prob = [
             vcat(rgb, depth)
@@ -1099,10 +1229,13 @@ class ModelWrapper(LightningModule):
         if self.optimizer_cfg.lr_monodepth > 0:
             pretrained_params = []
             new_params = []
+            gs_cube_params = []
 
             for name, param in self.named_parameters():
                 if "pretrained" in name:
                     pretrained_params.append(param)
+                elif "gs_cube_encoder" in name:
+                    gs_cube_params.append(param)
                 else:
                     new_params.append(param)
 
@@ -1113,13 +1246,14 @@ class ModelWrapper(LightningModule):
                         "lr": self.optimizer_cfg.lr_monodepth,
                     },
                     {"params": new_params, "lr": self.optimizer_cfg.lr},
+                    {"params": gs_cube_params, "lr": self.optimizer_cfg.lr_gs_cube},
                 ],
                 weight_decay=self.optimizer_cfg.weight_decay,
             )
 
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer,
-                [self.optimizer_cfg.lr_monodepth, self.optimizer_cfg.lr],
+                [self.optimizer_cfg.lr_monodepth, self.optimizer_cfg.lr, self.optimizer_cfg.lr_gs_cube],
                 self.trainer.max_steps + 10,
                 pct_start=0.01,
                 cycle_momentum=False,

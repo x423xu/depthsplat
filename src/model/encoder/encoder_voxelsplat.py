@@ -20,14 +20,14 @@ from .visualization.encoder_visualizer_depthsplat_cfg import EncoderVisualizerDe
 import torchvision.transforms as T
 import torch.nn.functional as F
 
-from .unimatch.mv_unimatch import MultiViewUniMatch
+from .unimatch.mv_feature_extractor import FeatureExtractor
 from .unimatch.dpt_head import DPTHead
 
 DEBUG = False
 
 @dataclass
-class EncoderDepthSplatCfg:
-    name: Literal["depthsplat"]
+class EncoderVoxelSplatCfg:
+    name: Literal["voxelsplat"]
     d_feature: int
     num_depth_candidates: int
     num_surfaces: int
@@ -75,19 +75,18 @@ class EncoderDepthSplatCfg:
     gaussians_per_cell: int
     down_strides: List[int]
     cell_scale: int
-    cube_encoder_type: str  # small, base, large
 
 
-class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
+class EncoderVoxelSplat(Encoder[EncoderVoxelSplatCfg]):
     def __init__(self, 
-                 cfg: EncoderDepthSplatCfg, 
+                 cfg: EncoderVoxelSplatCfg, 
                  gs_cube:bool = False,
                  vggt_meta:bool = False) -> None:
         super().__init__(cfg)
 
         self.vggt_meta = vggt_meta
 
-        self.depth_predictor = MultiViewUniMatch(
+        self.depth_predictor = FeatureExtractor(
             num_scales=cfg.num_scales,
             upsample_factor=cfg.upsample_factor,
             lowest_feature_resolution=cfg.lowest_feature_resolution,
@@ -116,8 +115,8 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         # gaussians adapter
         self.gaussian_adapter = GaussianAdapter(cfg.gaussian_adapter)
 
-        # concat(img, depth, match_prob, features)
-        in_channels = 3 + 1 + 1 + feature_upsampler_channels
+        # concat(img, depth, features)
+        in_channels = 3 + 1 + feature_upsampler_channels
         channels = self.cfg.gaussian_regressor_channels
 
         # conv regressor
@@ -131,12 +130,12 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
 
         # predict gaussian parameters: scale, q, sh, offset, opacity
         if self.vggt_meta:
-            num_gaussian_parameters = self.gaussian_adapter.d_in + 2 + 1 +1 # xyz offset
+            num_gaussian_parameters = self.gaussian_adapter.d_in + 2 + 1 # depth offset
         else:
             num_gaussian_parameters = self.gaussian_adapter.d_in + 2 + 1
 
-        # concat(img, features, regressor_out, match_prob)
-        in_channels = 3 + feature_upsampler_channels + channels + 1
+        # concat(img, features, regressor_out)
+        in_channels = 3 + feature_upsampler_channels + channels
         self.gaussian_head = nn.Sequential(
                 nn.Conv2d(in_channels, num_gaussian_parameters,
                           3, 1, 1, padding_mode='replicate'),
@@ -162,49 +161,45 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         self.gs_cube = gs_cube
         if gs_cube:
             down_strides = cfg.down_strides
-            if cfg.cube_encoder_type == 'large':
-                self.gs_cube_encoder = GSCubeEncoder(
-                    depths=[2, 4, 9, 4, 4],
-                    channels=[48, 96, 192, 384, 384],
-                    num_heads=[6, 6, 12, 24, 24],
-                    window_sizes=[5, 7, 7, 7, 7],
-                    quant_size=4,
-                    in_channels = 132,
-                    down_strides=down_strides,
-                    knn_down=True,
-                    upsample= 'linear_attn',
-                    cRSE='XYZ_RGB',
-                    up_k= 3,
-                    num_classes=13,
-                    stem_transformer=True,
-                    fp16_mode=0,
-                    num_gaussian_parameters = num_gaussian_parameters+1,
-                    gpc = self.cfg.gaussians_per_cell,
-                    cell_scale = self.cfg.cell_scale,
-                )
-            elif cfg.cube_encoder_type == 'small':
-                self.gs_cube_encoder = GSCubeEncoder(
-                    depths=[2, 2],
-                    channels=[256, 384],
-                    num_heads=[16, 24],
-                    window_sizes=[5, 5],
-                    num_layers=2,
-                    quant_size=4,
-                    in_channels = 132,
-                    down_strides=down_strides,
-                    knn_down=True,
-                    upsample= 'linear_attn',
-                    cRSE='XYZ_RGB',
-                    up_k= 3,
-                    num_classes=13,
-                    stem_transformer=True,
-                    fp16_mode=0,
-                    num_gaussian_parameters = num_gaussian_parameters+1,
-                    gpc = self.cfg.gaussians_per_cell,
-                    cell_scale = self.cfg.cell_scale,
-                )
-            else:
-                raise NotImplementedError
+            # self.gs_cube_encoder = GSCubeEncoder(
+            #     depths=[2, 4, 9, 4, 4],
+            #     channels=[48, 96, 192, 384, 384],
+            #     num_heads=[6, 6, 12, 24, 24],
+            #     window_sizes=[5, 7, 7, 7, 7],
+            #     quant_size=4,
+            #     in_channels = 132,
+            #     down_strides=down_strides,
+            #     knn_down=True,
+            #     upsample= 'linear_attn',
+            #     cRSE='XYZ_RGB',
+            #     up_k= 3,
+            #     num_classes=13,
+            #     stem_transformer=True,
+            #     fp16_mode=0,
+            #     num_gaussian_parameters = num_gaussian_parameters+1,
+            #     gpc = self.cfg.gaussians_per_cell,
+            #     cell_scale = self.cfg.cell_scale,
+            # )
+            self.gs_cube_encoder = GSCubeEncoder(
+                depths=[2, 2],
+                channels=[256, 384],
+                num_heads=[16, 24],
+                window_sizes=[5, 5],
+                num_layers=2,
+                quant_size=4,
+                in_channels = in_channels,
+                down_strides=down_strides,
+                knn_down=True,
+                upsample= 'linear_attn',
+                cRSE='XYZ_RGB',
+                up_k= 3,
+                num_classes=13,
+                stem_transformer=True,
+                fp16_mode=0,
+                num_gaussian_parameters = num_gaussian_parameters if vggt_meta else num_gaussian_parameters+1,
+                gpc = self.cfg.gaussians_per_cell,
+                cell_scale = self.cfg.cell_scale,
+            )
             self.dense_gaussian_adapter = DenseGaussianAdapter(cfg.gaussian_adapter)
             self.gpc = self.cfg.gaussians_per_cell
             # use the gs cube model
@@ -270,59 +265,28 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         else:
             cameras_dist_index = None
 
+        
+        raw_depth = context["depth"]
+        
         # depth prediction
         results_dict = self.depth_predictor(
             context["image"],
             attn_splits_list=[2],
-            min_depth=1. / context["far"],
-            max_depth=1. / context["near"],
+            min_depth=context["near"],
+            max_depth=context["far"],
             intrinsics=context["intrinsics"],
             extrinsics=context["extrinsics"],
             nn_matrix=cameras_dist_index,
+            raw_depth=raw_depth,
         )
+        # list of [B, V, H, W], with all the intermediate depths
+        depth_preds = results_dict['depth_preds']
 
-        if self.vggt_meta:
-            depth = context["depth"]
-            depth_preds = depth[None]
-        else:
-            # list of [B, V, H, W], with all the intermediate depths
-            depth_preds = results_dict['depth_preds']
-
-            # [B, V, H, W]
-            depth = depth_preds[-1]
+        # [B, V, H, W]
+        depth = depth_preds[-1]
 
         # depth = depth + 0.05*torch.randn_like(depth)  # add noise to depth
 
-        if self.cfg.train_depth_only:
-            # convert format
-            # [B, V, H*W, 1, 1]
-            depths = rearrange(depth, "b v h w -> b v (h w) () ()")
-
-            if self.cfg.supervise_intermediate_depth and len(depth_preds) > 1:
-                # supervise all the intermediate depth predictions
-                num_depths = len(depth_preds)
-
-                # [B, V, H*W, 1, 1]
-                intermediate_depths = torch.cat(
-                    depth_preds[:(num_depths - 1)], dim=0)
-                intermediate_depths = rearrange(
-                    intermediate_depths, "b v h w -> b v (h w) () ()")
-
-                # concat in the batch dim
-                depths = torch.cat((intermediate_depths, depths), dim=0)
-
-                b *= num_depths
-
-            # return depth prediction for supervision
-            depths = rearrange(
-                depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w
-            ).squeeze(-1).squeeze(-1)
-            # print(depths.shape)  # [B, V, H, W]
-
-            return {
-                "gaussians": None,
-                "depths": depths
-            }
         # features [BV, C, H, W]
         features = self.feature_upsampler(results_dict["features_mono_intermediate"],
                                           cnn_features=results_dict["features_cnn_all_scales"][::-1],
@@ -330,19 +294,10 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                                           0] if self.cfg.num_scales == 1 else results_dict["features_mv"][::-1]
                                           )
 
-        # match prob from softmax
-        # [BV, D, H, W] in feature resolution
-        match_prob = results_dict['match_probs'][-1]
-        match_prob = torch.max(match_prob, dim=1, keepdim=True)[
-            0]  # [BV, 1, H, W]
-        match_prob = F.interpolate(
-            match_prob, size=depth.shape[-2:], mode='nearest')
-
         # unet input
         concat = torch.cat((
             rearrange(context["image"], "b v c h w -> (b v) c h w"),
             rearrange(depth, "b v h w -> (b v) () h w"),
-            match_prob,
             features,
         ), dim=1)
 
@@ -351,8 +306,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         concat = [out,
                     rearrange(context["image"],
                             "b v c h w -> (b v) c h w"),
-                    features,
-                    match_prob]
+                    features,]
 
         out = torch.cat(concat, dim=1)
 
@@ -376,15 +330,16 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                                                depth_min = context["near"][0,0],
                                                depth_max = context["far"][0,0],
                                                num_depth=128,
-                                               return_perview=False)
+                                               return_perview=False,
+                                               vggt_meta=self.vggt_meta)
 
             cube_feat = rearrange(gs_cube.F, "n (c gpc) -> n c gpc", gpc=self.gpc)
             cube_opacities = cube_feat[:, :1].sigmoid()
 
             offset_xyz = cube_feat[:, 1:4].sigmoid()
             voxel_size = input_cube_tensor.cell_sizes
-            xyz = gs_cube.C.type(torch.float32)[:,1:4]
-            # xyz = gs_cube.C.type(torch.float32)[:,1:4] + coords_sp.F[:, 1:4] - coords_sp.F[:, 1:4].detach()
+            # xyz = gs_cube.C.type(torch.float32)[:,1:4]
+            xyz = gs_cube.C.type(torch.float32)[:,1:4] + coords_sp.F[:, 1:4] - coords_sp.F[:, 1:4].detach()
 
             if DEBUG:
                 from ...geometry.projection import get_fov, homogenize_points
@@ -446,9 +401,6 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             )
             
 
-        # [B, V, H*W, 1, 1]
-        densities = rearrange(
-            match_prob, "(b v) c h w -> b v (c h w) () ()", b=b, v=v)
         # [B, V, H*W, 84]
         raw_gaussians = rearrange(
             gaussians, "b v c h w -> b v (h w) c")
@@ -468,8 +420,6 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             # concat in the batch dim
             depths = torch.cat((intermediate_depths, depths), dim=0)
 
-            # shared color head
-            densities = torch.cat([densities] * num_depths, dim=0)
             raw_gaussians = torch.cat(
                 [raw_gaussians] * num_depths, dim=0)
 
@@ -494,11 +444,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         
         pixel_size = 1 / \
             torch.tensor((w, h), dtype=torch.float32, device=device)
-        if self.vggt_meta:
-            pixel_size *= 5
-            offset_depth = gaussians[..., 2:3].sigmoid()
-            depths = depths + (offset_depth-0.5)*0.2
-        xy_ray = xy_ray + (offset_xy - 0.5) * pixel_size
+        xy_ray = xy_ray + (offset_xy - 0.5)
 
         sh_input_images = context["image"]
 
@@ -515,7 +461,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                 depths,
                 opacities,
                 rearrange(
-                    gaussians[..., 3:],
+                    gaussians[..., 2:],
                     "b v r srf c -> b v r srf () c",
                 ) if self.vggt_meta else rearrange(
                     gaussians[..., 2:],
@@ -538,7 +484,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                 depths,
                 opacities,
                 rearrange(
-                    gaussians[..., 3:],
+                    gaussians[..., 2:],
                     "b v r srf c -> b v r srf () c",
                 ) if self.vggt_meta else rearrange(
                     gaussians[..., 2:],

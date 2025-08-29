@@ -5,6 +5,7 @@ import torch
 from einops import rearrange, repeat
 from jaxtyping import Float
 from torch import Tensor
+from wandb import Image
 
 from ...dataset import DatasetCfg
 from ..types import Gaussians
@@ -41,6 +42,8 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         far: Float[Tensor, "batch view"],
         image_shape: tuple[int, int],
         depth_mode: DepthRenderingMode | None = None,
+        scale_invariant: bool=False,
+        vggt_meta: bool = False
     ) -> DecoderOutput:
         b, v, _, _ = extrinsics.shape
         color = render_cuda(
@@ -54,15 +57,27 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             repeat(gaussians.covariances, "b g i j -> (b v) g i j", v=v),
             repeat(gaussians.harmonics, "b g c d_sh -> (b v) g c d_sh", v=v),
             repeat(gaussians.opacities, "b g -> (b v) g", v=v),
+            scale_invariant = scale_invariant,
+            vggt_meta = vggt_meta,
         )
         color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)
 
+        # if self.training:
+        #     from PIL import Image as pil_img
+        #     for i in range(b):
+        #         for j in range(v):
+        #             img = color[i, j].detach().cpu().numpy().transpose(1, 2, 0)
+        #             img = (img-img.min()) / (img.max() - img.min())
+        #             img = (img * 255).astype('uint8')
+        #             img = pil_img.fromarray(img)
+        #             img.save(f'target_{i}_{j}.png')
+        #     raise 'quit'
         return DecoderOutput(
             color,
             None
             if depth_mode is None
             else self.render_depth(
-                gaussians, extrinsics, intrinsics, near, far, image_shape, depth_mode
+                gaussians, extrinsics, intrinsics, near, far, image_shape, depth_mode, vggt_meta=vggt_meta
             ),
         )
 
@@ -75,6 +90,7 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         far: Float[Tensor, "batch view"],
         image_shape: tuple[int, int],
         mode: DepthRenderingMode = "depth",
+        vggt_meta:bool = False
     ) -> Float[Tensor, "batch view height width"]:
         b, v, _, _ = extrinsics.shape
         result = render_depth_cuda(
@@ -87,5 +103,6 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             repeat(gaussians.covariances, "b g i j -> (b v) g i j", v=v),
             repeat(gaussians.opacities, "b g -> (b v) g", v=v),
             mode=mode,
+            vggt_meta=vggt_meta
         )
         return rearrange(result, "(b v) h w -> b v h w", b=b, v=v)

@@ -114,4 +114,41 @@ def save_gaussian_ply(gaussians, visualization_dump, example, save_path):
         save_path,
     )
 
+def save_gaussian_cube_ply(gaussians, visualization_dump, example, save_path):
+
+    # v, _, h, w = example["context"]["image"].shape[1:]
+
+    # # Transform means into camera space.
+    # means = gaussians.means # N, xyz
+
+    # # convert the rotations from camera space to world space as required
+    # cam_rotations = visualization_dump["rotations"][0]
+    # cam_rotations = repeat(
+    #     cam_rotations, "n c -> n v c", v = v
+    # )
+    # c2w_mat = repeat(
+    #     example["context"]["extrinsics"][0, :, :3, :3],
+    #     "v a b -> n v a b",
+    #     n = cam_rotations.shape[0],
+    #     v=v,
+    # )
+
+    # cam_rotations_np = R.from_quat(
+    #     cam_rotations.detach().cpu().numpy()
+    # ).as_matrix()
+    # world_mat = c2w_mat.detach().cpu().numpy() @ cam_rotations_np
+    # world_rotations = R.from_matrix(world_mat).as_quat()
+    # world_rotations = torch.from_numpy(world_rotations).to(
+    #     visualization_dump["scales"]
+    # )
+
+    export_ply(
+        example["context"]["extrinsics"][0, 0],
+        gaussians.means[0],
+        visualization_dump["cube_scales"][0],
+        visualization_dump["cube_rotations"][0],
+        gaussians.harmonics[0],
+        gaussians.opacities[0],
+        save_path,
+    )
 

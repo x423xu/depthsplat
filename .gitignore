@@ -172,3 +172,5 @@ log*
 wandb/
 *.txt
 *.png
+notes/
+comparisons/

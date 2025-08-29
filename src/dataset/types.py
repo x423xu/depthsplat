@@ -20,6 +20,8 @@ class BatchedViews(TypedDict, total=False):
     near: Float[Tensor, "batch _"]  # batch view
     far: Float[Tensor, "batch _"]  # batch view
     index: Int64[Tensor, "batch _"]  # batch view
+    depth: Float[Tensor, "batch _ _"]  # batch view
+    depth_conf: Float[Tensor, "batch _ _"]  # batch view
 
 
 class BatchedExample(TypedDict, total=False):

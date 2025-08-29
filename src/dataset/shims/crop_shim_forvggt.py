@@ -28,6 +28,7 @@ def center_crop(
     intrinsics: Float[Tensor, "*#batch 3 3"],
     shape: tuple[int, int],
     depths: None | Float[Tensor, "*#batch h w"],
+    depth_conf: None | Float[Tensor, "*#batch h w"]
 ) -> (
     tuple[
         Float[Tensor, "*#batch c h_out w_out"],  # updated images
@@ -37,6 +38,7 @@ def center_crop(
         Float[Tensor, "*#batch c h_out w_out"],  # updated images
         Float[Tensor, "*#batch 3 3"],  # updated intrinsics
         Float[Tensor, "*#batch h_out w_out"],  # updated depths
+        Float[Tensor, "*#batch h_out w_out"], # depth_conf
     ]
 ):
     *_, h_in, w_in = images.shape
@@ -51,12 +53,17 @@ def center_crop(
 
     # Adjust the intrinsics to account for the cropping.
     intrinsics = intrinsics.clone()
-    intrinsics[..., 0, 0] *= w_in / w_out  # fx
-    intrinsics[..., 1, 1] *= h_in / h_out  # fy
+    '''
+    for crops, the same world coordinate point should be at the same position before and after crop.
+    So the depth should not change, but the cx and cy should be shifted accordinaly.
+    '''
+    intrinsics[:,0,2]-=col
+    intrinsics[:,1,2]-=row
 
     if depths is not None:
         depths = depths[..., :, row : row + h_out, col : col + w_out]
-        return images, intrinsics, depths
+        depth_conf = depth_conf[..., :, row : row + h_out, col : col + w_out]
+        return images, intrinsics, depths, depth_conf
 
     return images, intrinsics
 
@@ -66,6 +73,7 @@ def rescale_and_crop(
     intrinsics: Float[Tensor, "*#batch 3 3"],
     shape: tuple[int, int],
     depths: None | Float[Tensor, "*#batch h w"],
+    depth_conf: None | Float[Tensor, "*#batch h w"],
 ) -> (
     tuple[
         Float[Tensor, "*#batch c h_out w_out"],  # updated images
@@ -75,6 +83,7 @@ def rescale_and_crop(
         Float[Tensor, "*#batch c h_out w_out"],  # updated images
         Float[Tensor, "*#batch 3 3"],  # updated intrinsics
         Float[Tensor, "*#batch h_out w_out"],  # updated depths
+        Float[Tensor, "*#batch h_out w_out"],  # updated depth_conf
     ]
 ):
     *_, h_in, w_in = images.shape
@@ -85,6 +94,11 @@ def rescale_and_crop(
     h_scaled = round(h_in * scale_factor)
     w_scaled = round(w_in * scale_factor)
     assert h_scaled == h_out or w_scaled == w_out
+
+    '''
+    image is scaled, the intrinsics should be scaled accordingly, assuming the depth is not scaled.
+    '''
+    intrinsics[:,:2,:] *= scale_factor
 
     # Reshape the images to the correct size. Assume we don't have to worry about
     # changing the intrinsics based on how the images are rounded.
@@ -102,24 +116,35 @@ def rescale_and_crop(
             align_corners=True,
         ).squeeze(1)
 
-    return center_crop(images, intrinsics, shape, depths=depths)
+        depth_conf = F.interpolate(
+            depth_conf.unsqueeze(1),
+            size=(h_scaled, w_scaled),
+            mode="bilinear",
+            align_corners=True,
+        ).squeeze(1)
+
+    return center_crop(images, intrinsics, shape, depths=depths, depth_conf=depth_conf)
 
 
 def apply_crop_shim_to_views(views: AnyViews, shape: tuple[int, int]) -> AnyViews:
-    images, intrinsics = rescale_and_crop(
-        views["image"], views["intrinsics"], shape, depths=None
+    images, intrinsics, depths, depth_conf = rescale_and_crop(
+        views["image"], views["intrinsics"], shape, depths=views["depth"], depth_conf=views["depth_conf"]
     )
-    return {
+    new_dict = {
         **views,
         "image": images,
         "intrinsics": intrinsics,
+        "depth": depths,
+        "depth_conf": depth_conf
     }
+    return new_dict
 
 
-def apply_crop_shim(example: AnyExample, shape: tuple[int, int]) -> AnyExample:
+def apply_crop_shim_forvggt(example: AnyExample, shape: tuple[int, int]) -> AnyExample:
     """Crop images in the example."""
-    return {
+    new_dict = {
         **example,
         "context": apply_crop_shim_to_views(example["context"], shape),
         "target": apply_crop_shim_to_views(example["target"], shape),
     }
+    return new_dict
