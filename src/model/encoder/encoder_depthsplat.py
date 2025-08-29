@@ -168,6 +168,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             )
             self.dense_gaussian_adapter = DenseGaussianAdapter(cfg.gaussian_adapter)
             self.gpc = self.cfg.gaussians_per_cell
+
             # use the gs cube model
             # self.gaussian_head_x = nn.Sequential(
             #     nn.Conv2d(in_channels, num_gaussian_parameters, 3, 1, 1, padding_mode='replicate'),
