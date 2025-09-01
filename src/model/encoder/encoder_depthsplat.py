@@ -370,7 +370,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             # depth = depth.detach()
             # depths = depths.detach()
             # out = out.detach()
-            gs_cube,coords_sp, input_cube_tensor, input_cube_tensor_perview, nog_pb, nog_min = self.gs_cube_encoder(context["image"], depth, 
+            gs_cube,coords_sp_input, input_cube_tensor, input_cube_tensor_perview, nog_pb, nog_min = self.gs_cube_encoder(context["image"], depth, 
                                                rearrange(out, "(b v) c h w -> b v c h w", b=b, v=v), 
                                                extrinsics = context["extrinsics"], 
                                                intrinsics=context["intrinsics"],
@@ -384,8 +384,9 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
 
             offset_xyz = cube_feat[:, 1:4].sigmoid()
             voxel_size = input_cube_tensor.cell_sizes
-            xyz = gs_cube.C.type(torch.float32)[:,1:4]
-            # xyz = gs_cube.C.type(torch.float32)[:,1:4] + coords_sp.F[:, 1:4] - coords_sp.F[:, 1:4].detach()
+            # xyz = gs_cube.C.type(torch.float32)[:,1:4]
+            '''Make sure the grad is backpropagated from output opacities to input depth, thus to before encoder'''
+            xyz = gs_cube.C.type(torch.float32)[:,1:4] + coords_sp_input.F[:, 1:4] - coords_sp_input.F[:, 1:4].detach()
 
             if DEBUG:
                 from ...geometry.projection import get_fov, homogenize_points

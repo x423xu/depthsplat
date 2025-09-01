@@ -222,7 +222,7 @@ class GSCubeEncoder(Swin3DUNet):
         nog_min = nog_min // b
         if return_perview:
             return sp, coords_sp, gs_cube_input, gs_cube_input_perview, nog_pb, nog_min
-        return sp, coords_sp,gs_cube_input, None, nog_pb, nog_min
+        return sp, gs_cube_input.coords_sp, gs_cube_input, None, nog_pb, nog_min
 
     def voxelize(self, xyz_world, feats, imgs, num_depth, b=None, v=None, h=None, w=None, return_perview=False):
         '''
