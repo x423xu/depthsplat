@@ -1,5 +1,5 @@
 defaults:
-  - dataset: re10k
+  - dataset: re10k_unbounded
   - optional dataset/view_sampler_dataset_specific_config: ${dataset/view_sampler}_${dataset}
   - model/encoder: depthsplat
   - model/decoder: splatting_cuda
@@ -37,7 +37,7 @@ data_loader:
 optimizer:
   lr: 2.e-4
   lr_monodepth: 2.e-6
-  lr_gs_cube: 2e-4
+  lr_gs_cube: 1e-4
   warm_up_steps: 2000
   weight_decay: 0.01
 
@@ -105,3 +105,4 @@ train_controller:
   base_model: false
   vggt_meta: false
   backbone: [dino]
+  position_aware: false

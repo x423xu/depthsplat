@@ -8,6 +8,7 @@ from .view_sampler_arbitrary import ViewSamplerArbitrary, ViewSamplerArbitraryCf
 from .view_sampler_bounded import ViewSamplerBounded, ViewSamplerBoundedCfg
 from .view_sampler_evaluation import ViewSamplerEvaluation, ViewSamplerEvaluationCfg
 from .view_sampler_bounded_v2 import ViewSamplerBoundedV2, ViewSamplerBoundedV2Cfg
+from .view_sampler_unbounded import ViewSamplerUnbounded, ViewSamplerUnboundedCfg
 
 
 VIEW_SAMPLERS: dict[str, ViewSampler[Any]] = {
@@ -16,6 +17,7 @@ VIEW_SAMPLERS: dict[str, ViewSampler[Any]] = {
     "bounded": ViewSamplerBounded,
     "evaluation": ViewSamplerEvaluation,
     "boundedv2": ViewSamplerBoundedV2,
+    "unbounded": ViewSamplerUnbounded,
 }
 
 ViewSamplerCfg = (
@@ -24,6 +26,7 @@ ViewSamplerCfg = (
     | ViewSamplerEvaluationCfg
     | ViewSamplerAllCfg
     | ViewSamplerBoundedV2Cfg
+    | ViewSamplerUnboundedCfg
 )
 
 

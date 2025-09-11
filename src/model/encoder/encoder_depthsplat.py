@@ -76,16 +76,19 @@ class EncoderDepthSplatCfg:
     down_strides: List[int]
     cell_scale: int
     cube_encoder_type: str  # small, base, large
+    cube_merge_type: str
 
 
 class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
     def __init__(self, 
                  cfg: EncoderDepthSplatCfg, 
                  gs_cube:bool = False,
-                 vggt_meta:bool = False) -> None:
+                 vggt_meta:bool = False,
+                 position_aware:bool = False) -> None:
         super().__init__(cfg)
 
         self.vggt_meta = vggt_meta
+        self.position_aware = position_aware
 
         self.depth_predictor = MultiViewUniMatch(
             num_scales=cfg.num_scales,
@@ -95,6 +98,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             unet_channels=cfg.depth_unet_channels,
             grid_sample_disable_cudnn=cfg.grid_sample_disable_cudnn,
         )
+        self.upsample_factor = cfg.upsample_factor
 
         if self.cfg.train_depth_only:
             return
@@ -162,12 +166,43 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         self.gs_cube = gs_cube
         if gs_cube:
             down_strides = cfg.down_strides
-            if cfg.cube_encoder_type == 'large':
-                self.gs_cube_encoder = GSCubeEncoder(
-                    depths=[2, 4, 9, 4, 4],
-                    channels=[48, 96, 192, 384, 384],
-                    num_heads=[6, 6, 12, 24, 24],
-                    window_sizes=[5, 7, 7, 7, 7],
+            cube_merge_type = cfg.cube_merge_type
+            kwargs = {
+                'large':{
+                    'depths': [2, 4, 9, 4, 4],
+                    'channels': [48, 96, 192, 384, 384],
+                    'num_heads': [6, 6, 12, 24, 24],
+                    'window_sizes': [5, 7, 7, 7, 7],
+                    'num_layers':5,
+                },
+                'base':{
+                    'depths': [2, 4, 9, 4],
+                    'channels': [48, 96, 192, 384],
+                    'num_heads': [6, 6, 12, 24],
+                    'window_sizes': [5, 7, 7, 7],
+                    'num_layers':4,
+                },
+                'moderate':{
+                    'depths': [2, 4, 4],
+                    'channels': [48, 96, 384],
+                    'num_heads': [6, 6, 24],
+                    'window_sizes': [5, 7, 7],
+                    'num_layers':4,
+                },
+                'small':{
+                    'depths': [2, 2],
+                    'channels': [256, 384],
+                    'num_heads': [16, 24],
+                    'window_sizes': [5, 5],
+                    'num_layers':2
+                }
+            }
+            self.gs_cube_encoder = GSCubeEncoder(
+                    depths=kwargs[cfg.cube_encoder_type]['depths'],
+                    channels=kwargs[cfg.cube_encoder_type]['channels'],
+                    num_heads=kwargs[cfg.cube_encoder_type]['num_heads'],
+                    window_sizes=kwargs[cfg.cube_encoder_type]['window_sizes'],
+                    num_layers=kwargs[cfg.cube_encoder_type]['num_layers'],
                     quant_size=4,
                     in_channels = 132,
                     down_strides=down_strides,
@@ -181,30 +216,65 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                     num_gaussian_parameters = num_gaussian_parameters+1,
                     gpc = self.cfg.gaussians_per_cell,
                     cell_scale = self.cfg.cell_scale,
+                    position_aware = position_aware,
+                    cube_merge_type=cube_merge_type,
                 )
-            elif cfg.cube_encoder_type == 'small':
-                self.gs_cube_encoder = GSCubeEncoder(
-                    depths=[2, 2],
-                    channels=[256, 384],
-                    num_heads=[16, 24],
-                    window_sizes=[5, 5],
-                    num_layers=2,
-                    quant_size=4,
-                    in_channels = 132,
-                    down_strides=down_strides,
-                    knn_down=True,
-                    upsample= 'linear_attn',
-                    cRSE='XYZ_RGB',
-                    up_k= 3,
-                    num_classes=13,
-                    stem_transformer=True,
-                    fp16_mode=0,
-                    num_gaussian_parameters = num_gaussian_parameters+1,
-                    gpc = self.cfg.gaussians_per_cell,
-                    cell_scale = self.cfg.cell_scale,
+            if position_aware:
+                self.position_head = nn.Sequential(
+                    nn.Linear(kwargs[cfg.cube_encoder_type]['channels'][0], 3),
+                    nn.GELU(),
+                    nn.Linear(3, self.cfg.gaussians_per_cell*3),
                 )
-            else:
-                raise NotImplementedError
+                self.param_head = nn.Sequential(
+                    nn.Linear(kwargs[cfg.cube_encoder_type]['channels'][0]+3, num_gaussian_parameters-2),
+                    nn.GELU(),
+                    nn.Linear(num_gaussian_parameters-2, self.cfg.gaussians_per_cell*(num_gaussian_parameters-2)),
+                )
+            # if cfg.cube_encoder_type == 'large':
+            #     self.gs_cube_encoder = GSCubeEncoder(
+            #         depths=[2, 4, 9, 4, 4],
+            #         channels=[48, 96, 192, 384, 384],
+            #         num_heads=[6, 6, 12, 24, 24],
+            #         window_sizes=[5, 7, 7, 7, 7],
+            #         quant_size=4,
+            #         in_channels = 132,
+            #         down_strides=down_strides,
+            #         knn_down=True,
+            #         upsample= 'linear_attn',
+            #         cRSE='XYZ_RGB',
+            #         up_k= 3,
+            #         num_classes=13,
+            #         stem_transformer=True,
+            #         fp16_mode=0,
+            #         num_gaussian_parameters = num_gaussian_parameters+1,
+            #         gpc = self.cfg.gaussians_per_cell,
+            #         cell_scale = self.cfg.cell_scale,
+            #         position_aware = position_aware,
+            #     )
+            # elif cfg.cube_encoder_type == 'small':
+            #     self.gs_cube_encoder = GSCubeEncoder(
+            #         depths=[2, 2],
+            #         channels=[256, 384],
+            #         num_heads=[16, 24],
+            #         window_sizes=[5, 5],
+            #         num_layers=2,
+            #         quant_size=4,
+            #         in_channels = 132,
+            #         down_strides=down_strides,
+            #         knn_down=True,
+            #         upsample= 'linear_attn',
+            #         cRSE='XYZ_RGB',
+            #         up_k= 3,
+            #         num_classes=13,
+            #         stem_transformer=True,
+            #         fp16_mode=0,
+            #         num_gaussian_parameters = num_gaussian_parameters+1,
+            #         gpc = self.cfg.gaussians_per_cell,
+            #         cell_scale = self.cfg.cell_scale,
+            #         position_aware = position_aware,
+            #     )
+            # else:
+            #     raise NotImplementedError
             self.dense_gaussian_adapter = DenseGaussianAdapter(cfg.gaussian_adapter)
             self.gpc = self.cfg.gaussians_per_cell
 
@@ -377,12 +447,21 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                                                depth_min = context["near"][0,0],
                                                depth_max = context["far"][0,0],
                                                num_depth=128,
-                                               return_perview=False)
-
-            cube_feat = rearrange(gs_cube.F, "n (c gpc) -> n c gpc", gpc=self.gpc)
-            cube_opacities = cube_feat[:, :1].sigmoid()
-
-            offset_xyz = cube_feat[:, 1:4].sigmoid()
+                                               return_perview=False,
+                                               conf = match_prob)
+            
+       
+            if self.position_aware:
+                delta_xyz = self.position_head(gs_cube.F)
+                offset_xyz = rearrange(delta_xyz, " n (c gpc) -> n c gpc", gpc=self.gpc)
+                offset_xyz = offset_xyz.sigmoid()
+                print(torch.cat([gs_cube.F,delta_xyz], dim=-1).shape)
+                cube_feat = self.param_head(torch.cat([gs_cube.F,delta_xyz], dim=-1))
+                cube_opacities = rearrange(cube_feat, "n (c gpc) -> n c gpc", gpc=self.gpc)[:, :1].sigmoid()
+            else:
+                cube_feat = rearrange(gs_cube.F, "n (c gpc) -> n c gpc", gpc=self.gpc)
+                cube_opacities = cube_feat[:, :1].sigmoid()
+                offset_xyz = cube_feat[:, 1:4].sigmoid()
             voxel_size = input_cube_tensor.cell_sizes
             # xyz = gs_cube.C.type(torch.float32)[:,1:4]
             '''Make sure the grad is backpropagated from output opacities to input depth, thus to before encoder'''
@@ -432,7 +511,10 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                 # xyz_tmp[selected_ind] = xyz[selected_ind]* voxel_size[batch_idx] + input_cube_tensor.xyz_min[batch_idx]
             coords_xyz = rearrange(xyz_tmp,"n c -> n c ()") + offset 
             rgbs = input_cube_tensor.retrieve_rgb_from_batch_coords(gs_cube.C)
-            gs_cube = assign_feats(gs_cube,gs_cube.F[:,4*self.gpc:])
+            if self.position_aware:
+                gs_cube = assign_feats(gs_cube, cube_feat[:,1*self.gpc:])
+            else:
+                gs_cube = assign_feats(gs_cube,gs_cube.F[:,4*self.gpc:])
             
             '''
             It is noted that rgbs only exists where the context image is available, otherwise zeros are used.
@@ -588,7 +670,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         )
         
         if self.gs_cube:
-            # print('scale max', cube_gaussians.scales.max())
+
             cube_gaussians = Gaussians(
                 cube_gaussians.means,
                 cube_gaussians.covariances,

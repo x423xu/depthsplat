@@ -28,7 +28,7 @@ DEBUG=False
 
 @dataclass
 class DatasetRE10kCfg(DatasetCfgCommon):
-    name: Literal["re10k"]
+    name: Literal["re10k", "re10k_unbounded"]
     roots: list[Path]
     baseline_epsilon: float
     max_fov: float

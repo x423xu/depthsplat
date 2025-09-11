@@ -1,6 +1,7 @@
 import random
 from dataclasses import dataclass
 from typing import Callable
+import os
 
 import numpy as np
 import torch
@@ -53,6 +54,7 @@ DatasetShim = Callable[[Dataset, Stage], Dataset]
 def worker_init_fn(worker_id: int) -> None:
     random.seed(int(torch.utils.data.get_worker_info().seed) % (2**32 - 1))
     np.random.seed(int(torch.utils.data.get_worker_info().seed) % (2**32 - 1))
+    # print('worker started:', os.getpid(), f'worker_id: {worker_id}', flush=True)
 
 
 class DataModule(LightningDataModule):

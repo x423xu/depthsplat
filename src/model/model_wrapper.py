@@ -19,6 +19,8 @@ from tqdm import tqdm
 import torch.nn.functional as F
 import math
 from PIL import Image as PILImage
+import gc
+from torch import distributed as dist
 
 from ..dataset.data_module import get_data_shim
 from ..dataset.types import BatchedExample
@@ -172,36 +174,78 @@ class ModelWrapper(LightningModule):
         if self.test_cfg.compute_scores:
             self.test_step_outputs = {}
             self.time_skip_steps_dict = {"encoder": 0, "decoder": 0}
-        
+
+
+    def _handle_oom(self, where: str):
+        # free up as much as we can so the next batch can proceed
+        self.log("oom_batch", 1, prog_bar=True, on_step=True, logger=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
     def training_step(self, batch, batch_idx):
-        torch.cuda.empty_cache()
-        # reserved = torch.cuda.memory_reserved() / 1e9  # Total managed by PyTorch  
-        # allocated = torch.cuda.memory_allocated() / 1e9  # Active tensor usage  
-        # print(f"\nReserved memory: {reserved:.2f} GB, Allocated memory: {allocated:.2f} GB")
-        # print(torch.cuda.memory_summary())  
+        # forward
+        # torch.cuda.empty_cache()
+        opt = self.optimizers()
+        # ---- FORWARD ----
+        fwd_ok = torch.tensor(1, device=self.device, dtype=torch.int)
+        try:
+            total_loss = self.forward(batch, batch_idx)
+        except torch.cuda.OutOfMemoryError as e:
+            self._handle_oom("training_step")
+            print(f"Out of memory error in encoder: {e} at global_step: {self.global_step}, batch_idx: {batch_idx}, scene_names: {batch['scene']}")
+            fwd_ok.zero_()
+        except RuntimeError as e:
+            print(f"Runtime error in encoder: {e}")
+            print(f'global_step: {self.global_step}, batch_idx: {batch_idx}, scene_names: {batch["scene"]}')
+            fwd_ok.zero_()
+        except BaseException as e:
+            if 'out of memory' in str(e).lower() or 'cudaerrormemoryallocation' in str(e).lower():
+                self._handle_oom('forward-base')
+                print(f'global_step: {self.global_step}, batch_idx: {batch_idx}, scene_names: {batch["scene"]}, {str(e)}')
+                fwd_ok.zero_()
+            else:
+                raise
+        
+        # Global agreement BEFORE any backward/collective
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(fwd_ok, op=torch.distributed.ReduceOp.MIN)
+        
+        if fwd_ok.item() == 0:
+            # all ranks skip together
+            opt.zero_grad(set_to_none=True)
+            # keep ranks aligned
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                self.trainer.strategy.barrier()
+            # return a detached scalar for Lightning’s logging
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        return total_loss
+
+    def forward(self, batch, batch_idx):
+        
         batch: BatchedExample = self.data_shim(batch)
         _, _, _, h, w = batch["target"]["image"].shape
 
         # Run the model.
-        try:
+        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
             gaussians = self.encoder(
                 batch["context"], self.global_step, False, scene_names=batch["scene"]
             )
-        except RuntimeError as e:
-            print(f"Runtime error in encoder: {e}")
-            print(f'global_step: {self.global_step}, batch_idx: {batch_idx}, scene_names: {batch["scene"]}')
-            return torch.tensor(0.0, requires_grad=True)
+        
 
         if isinstance(gaussians, dict):
             if self.gs_cube:
                 nog_pb = gaussians["nog_pb"]
                 nog_min = gaussians["nog_min"]
-                self.log("train/nog_pb", nog_pb, prog_bar=True)
+                for i in range(len(nog_pb)):
+                    self.log(f"train/nog_pb_{i}", nog_pb[i], prog_bar=True)
                 self.log("train/nog_min", nog_min, prog_bar=True)
             pred_depths = gaussians["depths"]
             gaussians = gaussians["gaussians"]
             
+        # gaussians from bf16 to float 32   
+        gaussians = gaussians.as_float() 
         
         supervise_intermediate_depth = False
 
@@ -252,16 +296,17 @@ class ModelWrapper(LightningModule):
             )
 
         else:
-            output = self.decoder.forward(
-                gaussians,
-                batch["target"]["extrinsics"],
-                batch["target"]["intrinsics"],
-                batch["target"]["near"],
-                batch["target"]["far"],
-                (h, w),
-                depth_mode=self.train_cfg.depth_mode,
-                vggt_meta=self.vggt_meta
-            )
+            with torch.autocast(device_type=self.device.type, enabled=False):
+                output = self.decoder.forward(
+                    gaussians,
+                    batch["target"]["extrinsics"],
+                    batch["target"]["intrinsics"],
+                    batch["target"]["near"],
+                    batch["target"]["far"],
+                    (h, w),
+                    depth_mode=self.train_cfg.depth_mode,
+                    vggt_meta=self.vggt_meta
+                )
 
         target_gt = batch["target"]["image"]
 
@@ -399,7 +444,7 @@ class ModelWrapper(LightningModule):
         return total_loss
     
     def test_step(self, batch, batch_idx):
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
         batch: BatchedExample = self.data_shim(batch)
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
@@ -722,212 +767,213 @@ class ModelWrapper(LightningModule):
             render_pcs(points, colors, opacities, 'after_data_shim')
 
 
+        with torch.autocast(device_type=self.device.type, enabled=False):
+            # torch.cuda.empty_cache()
+            save_interval = 1000
+            batch: BatchedExample = self.data_shim(batch)
 
-        torch.cuda.empty_cache()
-        save_interval = 1000
-        batch: BatchedExample = self.data_shim(batch)
+            if self.global_rank == 0:
+                print(
+                    f"validation step {self.global_step}; "
+                    f"scene = {[a[:20] for a in batch['scene']]}; "
+                    f"context = {batch['context']['index'].tolist()}"
+                )
 
-        if self.global_rank == 0:
-            print(
-                f"validation step {self.global_step}; "
-                f"scene = {[a[:20] for a in batch['scene']]}; "
-                f"context = {batch['context']['index'].tolist()}"
-            )
-
-        # Render Gaussians.
-        b, _, _, h, w = batch["target"]["image"].shape
-        assert b == 1
-        if self.global_step % save_interval == 0 and self.global_rank == 0 and batch_idx==0:
-            visualization_dump = {}
-            gaussians_softmax = self.encoder(
-                batch["context"],
-                self.global_step,
-                deterministic=False,
-                visualization_dump=visualization_dump,
-            )
-        else:
-            gaussians_softmax = self.encoder(
-                batch["context"],
-                self.global_step,
-                deterministic=False,
-            )
-
-        pred_depths = None
-
-        if isinstance(gaussians_softmax, dict):
-            pred_depths = gaussians_softmax["depths"]
-            if "depth" in batch["context"]:
-                depth_gt = batch["context"]["depth"]  # [B, V, H, W]
-            gaussians_softmax = gaussians_softmax["gaussians"]
-
-        if not self.train_cfg.forward_depth_only:
-            output_softmax = self.decoder.forward(
-                gaussians_softmax,
-                batch["target"]["extrinsics"],
-                batch["target"]["intrinsics"],
-                batch["target"]["near"],
-                batch["target"]["far"],
-                (h, w),
-                vggt_meta = self.vggt_meta,
-            )
-            # output_softmax = self.decoder.forward(
-            #     gaussians_softmax,
-            #     batch["context"]["extrinsics"],
-            #     batch["context"]["intrinsics"],
-            #     batch["context"]["near"],
-            #     batch["context"]["far"],
-            #     (h, w),
-            #     vggt_meta = self.vggt_meta,
-            #     scale_invariant = True
-            # )
-            rgb_softmax = output_softmax.color[0]
-
-            # Compute validation metrics.
-            rgb_gt = batch["target"]["image"][0]
-            for tag, rgb in zip(("val",), (rgb_softmax,)):
-                psnr = compute_psnr(rgb_gt, rgb).mean()
-                self.log(f"val/psnr_{tag}", psnr)
-                lpips = compute_lpips(rgb_gt, rgb).mean()
-                self.log(f"val/lpips_{tag}", lpips)
-                ssim = compute_ssim(rgb_gt, rgb).mean()
-                self.log(f"val/ssim_{tag}", ssim)
-
-        # viz depth
-        if pred_depths is not None:
-            # only visualize predicted depth
-            pred_depths = pred_depths[0]  # [V, H, W]
-
-            # gaussian downsample
-            if pred_depths.shape[1:] != batch["context"]["image"].shape[-2:]:
-                pred_depths = F.interpolate(
-                    pred_depths.unsqueeze(1),
-                    size=batch["context"]["image"].shape[-2:],
-                    mode="bilinear",
-                    align_corners=True,
-                ).squeeze(1)
-            if self.vggt_meta:
-                inverse_depth_pred = 1.0/ pred_depths
+            # Render Gaussians.
+            b, _, _, h, w = batch["target"]["image"].shape
+            assert b == 1
+            if self.global_step % save_interval == 0 and self.global_rank == 0 and batch_idx==0:
+                visualization_dump = {}
+                gaussians_softmax = self.encoder(
+                    batch["context"],
+                    self.global_step,
+                    deterministic=False,
+                    visualization_dump=visualization_dump,
+                )
             else:
-                inverse_depth_pred = 1.0 / pred_depths
-
-            concat = []
-            for i in range(inverse_depth_pred.size(0)):
-                concat.append(inverse_depth_pred[i])
-
-            concat = torch.cat(concat, dim=1)  # [H, W*N]
-
-            depth_viz = viz_depth_tensor(concat.cpu().detach())  # [3, H, W*N]
-
-            # also concat images
-            input_images = batch["context"]["image"][0]  # [N, 3, H, W]
-            concat_img = [img for img in input_images]
-            concat_img = torch.cat(concat_img, dim=-1) * 255  # [3, H, W*N]
-
-            concat = torch.cat(
-                (concat_img.cpu().detach(), depth_viz), dim=1
-            )  # [3, H*2, W*N]
-
-            self.logger.log_image(
-                "depth",
-                [concat],
-                step=self.global_step,
-                caption=batch["scene"],
-            )
-
-        if not self.train_cfg.forward_depth_only:
-            # Construct comparison image.
-            comparison = hcat(
-                add_label(vcat(*batch["context"]["image"][0]), "Context"),
-                add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
-                add_label(vcat(*rgb_softmax), "Target (Prediction)"),
-            )
-            self.logger.log_image(
-                "comparison",
-                [prep_image(add_border(comparison))],
-                step=self.global_step,
-                caption=batch["scene"],
-            )
-            pil_img = PILImage.fromarray(prep_image(add_border(comparison)))
-            pil_img.save("comparisons/{}.png".format(self.global_step))
-
-            if not self.train_cfg.no_log_projections:
-                # Render projections and construct projection image.
-                projections = hcat(
-                    *render_projections(
-                        gaussians_softmax,
-                        256,
-                        extra_label="(Prediction)",
-                    )[0]
+                gaussians_softmax = self.encoder(
+                    batch["context"],
+                    self.global_step,
+                    deterministic=False,
                 )
+
+            pred_depths = None
+
+            if isinstance(gaussians_softmax, dict):
+                pred_depths = gaussians_softmax["depths"]
+                if "depth" in batch["context"]:
+                    depth_gt = batch["context"]["depth"]  # [B, V, H, W]
+                gaussians_softmax = gaussians_softmax["gaussians"]
+
+            if not self.train_cfg.forward_depth_only:
+                output_softmax = self.decoder.forward(
+                    gaussians_softmax,
+                    batch["target"]["extrinsics"],
+                    batch["target"]["intrinsics"],
+                    batch["target"]["near"],
+                    batch["target"]["far"],
+                    (h, w),
+                    vggt_meta = self.vggt_meta,
+                )
+                # output_softmax = self.decoder.forward(
+                #     gaussians_softmax,
+                #     batch["context"]["extrinsics"],
+                #     batch["context"]["intrinsics"],
+                #     batch["context"]["near"],
+                #     batch["context"]["far"],
+                #     (h, w),
+                #     vggt_meta = self.vggt_meta,
+                #     scale_invariant = True
+                # )
+                rgb_softmax = output_softmax.color[0]
+
+                # Compute validation metrics.
+                rgb_gt = batch["target"]["image"][0]
+                for tag, rgb in zip(("val",), (rgb_softmax,)):
+                    psnr = compute_psnr(rgb_gt, rgb).mean()
+                    self.log(f"val/psnr_{tag}", psnr)
+                    lpips = compute_lpips(rgb_gt, rgb).mean()
+                    self.log(f"val/lpips_{tag}", lpips)
+                    ssim = compute_ssim(rgb_gt, rgb).mean()
+                    self.log(f"val/ssim_{tag}", ssim)
+
+            # viz depth
+            if pred_depths is not None:
+                # only visualize predicted depth
+                pred_depths = pred_depths[0]  # [V, H, W]
+
+                # gaussian downsample
+                if pred_depths.shape[1:] != batch["context"]["image"].shape[-2:]:
+                    pred_depths = F.interpolate(
+                        pred_depths.unsqueeze(1),
+                        size=batch["context"]["image"].shape[-2:],
+                        mode="bilinear",
+                        align_corners=True,
+                    ).squeeze(1)
+                if self.vggt_meta:
+                    inverse_depth_pred = 1.0/ pred_depths
+                else:
+                    inverse_depth_pred = 1.0 / pred_depths
+
+                concat = []
+                for i in range(inverse_depth_pred.size(0)):
+                    concat.append(inverse_depth_pred[i])
+
+                concat = torch.cat(concat, dim=1)  # [H, W*N]
+
+                depth_viz = viz_depth_tensor(concat.cpu().detach())  # [3, H, W*N]
+
+                # also concat images
+                input_images = batch["context"]["image"][0]  # [N, 3, H, W]
+                concat_img = [img for img in input_images]
+                concat_img = torch.cat(concat_img, dim=-1) * 255  # [3, H, W*N]
+
+                concat = torch.cat(
+                    (concat_img.cpu().detach(), depth_viz), dim=1
+                )  # [3, H*2, W*N]
+
                 self.logger.log_image(
-                    "projection",
-                    [prep_image(add_border(projections))],
+                    "depth",
+                    [concat],
                     step=self.global_step,
+                    caption=batch["scene"],
                 )
 
-                # Draw cameras.
-                cameras = hcat(*render_cameras(batch, 256))
+            if not self.train_cfg.forward_depth_only:
+                # Construct comparison image.
+                comparison = hcat(
+                    add_label(vcat(*batch["context"]["image"][0]), "Context"),
+                    add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
+                    add_label(vcat(*rgb_softmax), "Target (Prediction)"),
+                )
                 self.logger.log_image(
-                    "cameras", [prep_image(add_border(cameras))], step=self.global_step
+                    "comparison",
+                    [prep_image(add_border(comparison))],
+                    step=self.global_step,
+                    caption=batch["scene"],
                 )
+                # pil_img = PILImage.fromarray(prep_image(add_border(comparison)))
+                # pil_img.save("comparisons/{}.png".format(self.global_step))
 
-            if self.encoder_visualizer is not None:
-                for k, image in self.encoder_visualizer.visualize(
-                    batch["context"], self.global_step
-                ).items():
-                    self.logger.log_image(k, [prep_image(image)], step=self.global_step)
+                if not self.train_cfg.no_log_projections:
+                    # Render projections and construct projection image.
+                    projections = hcat(
+                        *render_projections(
+                            gaussians_softmax,
+                            256,
+                            extra_label="(Prediction)",
+                        )[0]
+                    )
+                    self.logger.log_image(
+                        "projection",
+                        [prep_image(add_border(projections))],
+                        step=self.global_step,
+                    )
 
-            # Run video validation step.
-            if not self.train_cfg.no_viz_video:
-                self.render_video_interpolation(batch, vggt_meta=self.vggt_meta)
-                self.render_video_wobble(batch, vggt_meta=self.vggt_meta)
-                if self.train_cfg.extended_visualization:
-                    self.render_video_interpolation_exaggerated(batch, vggt_meta=self.vggt_meta)
+                    # Draw cameras.
+                    cameras = hcat(*render_cameras(batch, 256))
+                    self.logger.log_image(
+                        "cameras", [prep_image(add_border(cameras))], step=self.global_step
+                    )
 
-        if self.global_step % save_interval == 0 and self.global_rank == 0 and batch_idx==0:
-            if self.gs_cube:
-                print(f"Saving Gaussian cube at step {self.global_step}...")
-                scene = batch["scene"][0]
-                save_path = Path(get_cfg()['output_dir']) / 'gaussians_cube' / (scene + f'_{self.global_step}' + '.ply')
-                save_gaussian_cube_ply(gaussians_softmax, visualization_dump, batch, save_path)
-                visualization_dump = None
+                if self.encoder_visualizer is not None:
+                    for k, image in self.encoder_visualizer.visualize(
+                        batch["context"], self.global_step
+                    ).items():
+                        self.logger.log_image(k, [prep_image(image)], step=self.global_step)
+
+                # Run video validation step.
+                if not self.train_cfg.no_viz_video:
+                    self.render_video_interpolation(batch, vggt_meta=self.vggt_meta)
+                    self.render_video_wobble(batch, vggt_meta=self.vggt_meta)
+                    if self.train_cfg.extended_visualization:
+                        self.render_video_interpolation_exaggerated(batch, vggt_meta=self.vggt_meta)
+
+            if self.global_step % save_interval == 0 and self.global_rank == 0 and batch_idx==0:
+                if self.gs_cube:
+                    print(f"Saving Gaussian cube at step {self.global_step}...")
+                    scene = batch["scene"][0]
+                    save_path = Path(get_cfg()['output_dir']) / 'gaussians_cube' / (scene + f'_{self.global_step}' + '.ply')
+                    save_gaussian_cube_ply(gaussians_softmax, visualization_dump, batch, save_path)
+                    visualization_dump = None
 
     def on_validation_epoch_end(self) -> None:
-        """hack to run the full validation"""
-        if self.trainer.sanity_checking and self.global_rank == 0:
-            print(self.encoder)  # log the model to wandb log files
+        with torch.autocast(device_type=self.device.type, enabled=False):
+            """hack to run the full validation"""
+            if self.trainer.sanity_checking and self.global_rank == 0:
+                print(self.encoder)  # log the model to wandb log files
 
-        if (not self.trainer.sanity_checking) and (self.eval_data_cfg is not None):
-            self.eval_cnt = self.eval_cnt + 1
-            if self.eval_cnt % self.train_cfg.eval_model_every_n_val == 0:
-                # backup current ckpt before running full test sets eval
-                if self.train_cfg.eval_save_model:
-                    ckpt_saved_path = (
-                        self.trainer.checkpoint_callback.format_checkpoint_name(
-                            dict(
-                                epoch=self.trainer.current_epoch,
-                                step=self.trainer.global_step,
+            if (not self.trainer.sanity_checking) and (self.eval_data_cfg is not None):
+                self.eval_cnt = self.eval_cnt + 1
+                if self.eval_cnt % self.train_cfg.eval_model_every_n_val == 0:
+                    # backup current ckpt before running full test sets eval
+                    if self.train_cfg.eval_save_model:
+                        ckpt_saved_path = (
+                            self.trainer.checkpoint_callback.format_checkpoint_name(
+                                dict(
+                                    epoch=self.trainer.current_epoch,
+                                    step=self.trainer.global_step,
+                                )
                             )
                         )
-                    )
-                    backup_dir = str(
-                        Path(ckpt_saved_path).parent.parent / "checkpoints_backups"
-                    )
-                    if self.global_rank == 0:
-                        os.makedirs(backup_dir, exist_ok=True)
-                    ckpt_saved_path = os.path.join(
-                        backup_dir, os.path.basename(ckpt_saved_path)
-                    )
-                    # call save_checkpoint on ALL process as suggested by pytorch_lightning
-                    self.trainer.save_checkpoint(
-                        ckpt_saved_path,
-                        weights_only=True,
-                    )
-                    if self.global_rank == 0:
-                        print(f"backup model to {ckpt_saved_path}.")
+                        backup_dir = str(
+                            Path(ckpt_saved_path).parent.parent / "checkpoints_backups"
+                        )
+                        if self.global_rank == 0:
+                            os.makedirs(backup_dir, exist_ok=True)
+                        ckpt_saved_path = os.path.join(
+                            backup_dir, os.path.basename(ckpt_saved_path)
+                        )
+                        # call save_checkpoint on ALL process as suggested by pytorch_lightning
+                        self.trainer.save_checkpoint(
+                            ckpt_saved_path,
+                            weights_only=True,
+                        )
+                        if self.global_rank == 0:
+                            print(f"backup model to {ckpt_saved_path}.")
 
-                # run full test sets eval on rank=0 device
-                self.run_full_test_sets_eval()
+                    # run full test sets eval on rank=0 device
+                    self.run_full_test_sets_eval()
 
     @rank_zero_only
     def run_full_test_sets_eval(self) -> None:
@@ -965,6 +1011,7 @@ class ModelWrapper(LightningModule):
         ):
             if batch_idx >= self.train_cfg.eval_data_length:
                 break
+            # torch.cuda.empty_cache()
 
             batch = self.data_shim(batch)
             batch = self.transfer_batch_to_device(batch, "cuda", dataloader_idx=0)
