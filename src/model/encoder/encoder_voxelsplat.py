@@ -81,8 +81,7 @@ class EncoderVoxelSplat(Encoder[EncoderVoxelSplatCfg]):
     def __init__(self, 
                  cfg: EncoderVoxelSplatCfg, 
                  gs_cube:bool = False,
-                 vggt_meta:bool = False,
-                 position_aware:bool=False) -> None:
+                 vggt_meta:bool = False) -> None:
         super().__init__(cfg)
 
         self.vggt_meta = vggt_meta

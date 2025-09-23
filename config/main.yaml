@@ -105,4 +105,4 @@ train_controller:
   base_model: false
   vggt_meta: false
   backbone: [dino]
-  position_aware: false
+  random_scale: false

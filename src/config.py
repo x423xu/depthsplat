@@ -49,7 +49,7 @@ class TrainControllerCfg:
     base_model: bool
     vggt_meta: bool
     backbone: list[str]
-    position_aware: bool
+    random_scale: bool
 
 @dataclass
 class RootCfg:

@@ -339,7 +339,8 @@ class DatasetRE10k(IterableDataset):
                     print(
                         f"Skipped bad example {example['key']}. Context shape was "
                         f"{context_images.shape} and target shape was "
-                        f"{target_images.shape}."
+                        f"{target_images.shape}.",
+                        flush=True
                     )
                     continue
 

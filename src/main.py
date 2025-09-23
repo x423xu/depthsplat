@@ -155,14 +155,14 @@ def train(cfg_dict: DictConfig):
         num_nodes=cfg.trainer.num_nodes,
         plugins=LightningEnvironment() if cfg.use_plugins else None,
         profiler=None,
-        precision='bf16-mixed',
+        # precision='bf16-mixed',
     )
     torch.manual_seed(cfg_dict.seed + trainer.global_rank)
 
     encoder, encoder_visualizer = get_encoder(cfg.model.encoder,
                                               gs_cube=cfg.train_controller.gs_cube,
                                               vggt_meta=cfg.train_controller.vggt_meta,
-                                              position_aware=cfg.train_controller.position_aware)
+                                              random_scale=cfg.train_controller.random_scale)
 
     model_wrapper = ModelWrapper(
         cfg.optimizer,

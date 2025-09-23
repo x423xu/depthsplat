@@ -362,7 +362,8 @@ class AttentionBlock(nn.Module):
         self.postnorm = postnorm
 
     def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), False)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
+        # cell_scale=4: False, cell_scale=8: True
+        return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
         #return pt_checkpoint(self._forward, x)  # pytorch
 
     def _forward(self, x):
@@ -442,7 +443,6 @@ class CrossAttentionBlock(nn.Module):
 
     def forward(self, x, y=None):
         # return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
-        #return pt_checkpoint(self._forward, x)  # pytorch
         return self._forward(x, y)
 
     def _forward(self, x, y=None):
