@@ -51,6 +51,7 @@ class TrainControllerCfg:
     backbone: list[str]
     random_scale: bool
     knn_down: bool
+    dynamic_voxel: bool
 
 @dataclass
 class RootCfg:

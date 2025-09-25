@@ -107,3 +107,4 @@ train_controller:
   backbone: [dino]
   random_scale: false
   knn_down: false
+  dynamic_voxel: false
