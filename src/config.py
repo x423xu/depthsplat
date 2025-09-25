@@ -50,6 +50,7 @@ class TrainControllerCfg:
     vggt_meta: bool
     backbone: list[str]
     random_scale: bool
+    knn_down: bool
 
 @dataclass
 class RootCfg:

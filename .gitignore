@@ -179,3 +179,4 @@ run.sh
 depthsplat_re10k*
 train_model*
 *.pth
+*.pt

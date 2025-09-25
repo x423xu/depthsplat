@@ -86,11 +86,10 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                  cfg: EncoderDepthSplatCfg, 
                  gs_cube:bool = False,
                  vggt_meta:bool = False,
-                 random_scale:bool=False,) -> None:
+                 knn_down:bool=False) -> None:
         super().__init__(cfg)
 
         self.vggt_meta = vggt_meta
-        self.random_scale = random_scale
 
         self.depth_predictor = MultiViewUniMatch(
             num_scales=cfg.num_scales,
@@ -236,7 +235,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                     quant_size=4,
                     in_channels = 132,
                     down_strides=down_strides,
-                    knn_down=False,
+                    knn_down=knn_down,
                     upsample= 'linear_attn',
                     cRSE='XYZ_RGB',
                     up_k= 3,

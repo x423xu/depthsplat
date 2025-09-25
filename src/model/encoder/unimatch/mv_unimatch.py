@@ -245,6 +245,11 @@ class MultiViewUniMatch(nn.Module):
         images = self.normalize_images(images)
         b, v, _, ori_h, ori_w = images.shape
 
+        # debug nan
+        if torch.isnan(images).any():
+            print("Nan in images")
+            raise ValueError("Nan in images")
+
         # update the num_views in unet attention, useful for random input views
         set_num_views(self.regressor, num_views=v)
 
@@ -265,6 +270,11 @@ class MultiViewUniMatch(nn.Module):
         features_list_cnn = features_list_cnn[: self.num_scales]
         results_dict.update({"features_cnn_all_scales": features_list_cnn_all_scales})
         results_dict.update({"features_cnn": features_list_cnn})
+
+        # debug nan
+        if any(torch.isnan(f).any() for f in features_list_cnn):
+            print("Nan in features_list_cnn")
+            raise ValueError("Nan in features_list_cnn")
 
         # mv transformer features
         # add position to features
@@ -297,6 +307,11 @@ class MultiViewUniMatch(nn.Module):
             features_list_mv = self.mv_pyramid(features_mv)
         else:
             features_list_mv = [features_mv]
+
+        # debug nan
+        if any(torch.isnan(f).any() for f in features_list_mv):
+            print("Nan in features_list_mv")
+            raise ValueError("Nan in features_list_mv")
 
         results_dict.update({"features_mv": features_list_mv})
 
@@ -354,6 +369,11 @@ class MultiViewUniMatch(nn.Module):
         else:
             features_list_mono = [mono_features]
 
+        # debug nan
+        if any(torch.isnan(f).any() for f in features_list_mono):
+            print("Nan in features_list_mono")
+            raise ValueError("Nan in features_list_mono")
+
         results_dict.update({"features_mono": features_list_mono})
 
         depth = None
@@ -376,6 +396,11 @@ class MultiViewUniMatch(nn.Module):
                     rearrange(features_mv, "(b v) c h w -> b v c h w", b=b, v=v), dim=1
                 )
             )
+
+            # debug nan
+            if any(torch.isnan(f).any() for f in features_mv_curr):
+                print("Nan in features_mv_curr")
+                raise ValueError("Nan in features_mv_curr")
 
             intrinsics_curr = list(
                 torch.unbind(intrinsics_curr, dim=1)
@@ -497,6 +522,15 @@ class MultiViewUniMatch(nn.Module):
                 b=b_new,
                 v=tgt_features.size(1),
             )
+
+            #debug nan
+            if torch.isnan(warped_tgt_features).any():
+                print("Nan in warped_tgt_features")
+                raise ValueError("Nan in warped_tgt_features")
+            if torch.isnan(ref_features).any():
+                print("Nan in ref_features")
+                raise ValueError("Nan in ref_features")
+
             # [BV, V-1, D, H, W] -> [BV, D, H, W]
             # average cross other views
             cost_volume = (
@@ -512,6 +546,12 @@ class MultiViewUniMatch(nn.Module):
             concat = torch.cat(
                 (cost_volume, features_cnn, features_mv, features_mono), dim=1
             )
+
+
+            # debug nan
+            if torch.isnan(cost_volume).any():
+                print("Nan in cost_volume")
+                raise ValueError("Nan in cost_volume")
 
             out = self.regressor[scale_idx](concat) + self.regressor_residual[
                 scale_idx
@@ -563,6 +603,14 @@ class MultiViewUniMatch(nn.Module):
                 )
 
                 depth_preds.append(depth)
+        '''
+        We guess this part might cause Nan values in depth
+        debug nan
+        '''
+        for i in range(len(depth_preds)):
+            if torch.isnan(depth_preds[i]).any():
+                print("Nan in depth_preds")
+                raise ValueError("Nan in depth_preds before inverse")
 
         # convert inverse depth to depth
         for i in range(len(depth_preds)):
@@ -570,6 +618,12 @@ class MultiViewUniMatch(nn.Module):
             depth_preds[i] = rearrange(
                 depth_pred, "(b v) ... -> b v ...", b=b, v=v
             )  # [B, V, H, W]
+
+        # debug nan
+        for i in range(len(depth_preds)):
+            if torch.isnan(depth_preds[i]).any():
+                print("Nan in depth_preds")
+                raise ValueError("Nan in depth_preds after inverse")
 
         results_dict.update({"depth_preds": depth_preds})
         results_dict.update({"match_probs": match_probs})

@@ -140,6 +140,8 @@ class ModelWrapper(LightningModule):
         train_controller_cfg=None,
     ) -> None:
         super().__init__()
+        # self.automatic_optimization = False
+
         self.optimizer_cfg = optimizer_cfg
         self.test_cfg = test_cfg
         self.train_cfg = train_cfg
@@ -170,8 +172,6 @@ class ModelWrapper(LightningModule):
         self.benchmarker = Benchmarker()
         self.eval_cnt = 0
 
-
-
         if self.test_cfg.compute_scores:
             self.test_step_outputs = {}
             self.time_skip_steps_dict = {"encoder": 0, "decoder": 0}
@@ -185,6 +185,7 @@ class ModelWrapper(LightningModule):
         gc.collect()
 
     def training_step(self, batch, batch_idx):
+        # batch = torch.load("/data2/xxy/code/depthsplat/offending_batch.pt")
         # forward
         # torch.cuda.empty_cache()
         opt = self.optimizers()
@@ -192,6 +193,25 @@ class ModelWrapper(LightningModule):
         fwd_ok = torch.tensor(1, device=self.device, dtype=torch.int)
         try:
             total_loss = self.forward(batch, batch_idx)
+
+            # scheduler = self.lr_schedulers()
+            # # ---- BACKWARD ---- debug nan
+            # self.manual_backward(total_loss)
+            # nan=0
+            # for n,p in self.named_parameters():
+            #     if torch.isnan(p).any():
+            #         print(f'param nan: {n}')
+            #         nan = 1
+            #     if p.grad is not None and torch.isnan(p.grad).any():
+            #         print(f'grad nan: {n}')
+            #         nan =1
+            # if nan:
+            #     raise ValueError('nan in param or grad')
+            # self.clip_gradients(opt,0.5,gradient_clip_algorithm='norm')
+            # opt.step()
+            # opt.zero_grad()
+            # scheduler.step()
+                
         except torch.cuda.OutOfMemoryError as e:
             self._handle_oom("training_step")
             print(f"Out of memory error in encoder: {e} at global_step: {self.global_step}, batch_idx: {batch_idx}, scene_names: {batch['scene']}")
@@ -204,6 +224,13 @@ class ModelWrapper(LightningModule):
             self._handle_oom('value error')
             print(f"Value error in encoder: {e}")
             print(f'global_step: {self.global_step}, batch_idx: {batch_idx}, scene_names: {batch["scene"]}')
+            # for h in handles:
+            #     h.remove()
+            # debug Nan
+            # save model and optimizer and scheduler state
+            # torch.save(self.state_dict(), 'offending_model_optim_sched.pt')
+            # batch_to_save = {k: (v.detach().cpu() if torch.is_tensor(v) else v) for k,v in batch.items()}
+            # torch.save(batch_to_save, "offending_batch.pt")
             fwd_ok.zero_()
         except BaseException as e:
             if 'out of memory' in str(e).lower() or 'cudaerrormemoryallocation' in str(e).lower():
@@ -211,8 +238,7 @@ class ModelWrapper(LightningModule):
                 print(f'global_step: {self.global_step}, batch_idx: {batch_idx}, scene_names: {batch["scene"]}, {str(e)}')
                 fwd_ok.zero_()
             else:
-                raise
-        
+                raise e
         # Global agreement BEFORE any backward/collective
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.all_reduce(fwd_ok, op=torch.distributed.ReduceOp.MIN)
@@ -464,9 +490,9 @@ class ModelWrapper(LightningModule):
         # print('num_of_ctx_views', batch['context']['image'].shape[1])
         # print('num_of_tgt_views', batch['target']['image'].shape[1])
         
-        if batch['scene'][0] != '094fd37f09dc318c':
-            return
-        print(batch['scene'])
+        # if batch['scene'][0] != '094fd37f09dc318c':
+        #     return
+        # print(batch['scene'])
         # save input views for visualization
         if self.test_cfg.save_input_images:
             (scene,) = batch["scene"]

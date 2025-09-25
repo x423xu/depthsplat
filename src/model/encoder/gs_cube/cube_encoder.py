@@ -206,11 +206,9 @@ class GSCubeEncoder(Swin3DUNet):
         #               num_depth, b=b, v=v, h=h, w=w, return_perview=return_perview)
         # s3: encode
         sp_stack, coords_sp_stack, nog_min = self.encode(gs_cube_input.sp, gs_cube_input.coords_sp)
-        # sp_stack, coords_sp_stack, nog_min = cp.checkpoint(self.encode, gs_cube_input.sp, gs_cube_input.coords_sp)
         # s4: decode
 
         sp, coords_sp = self.decode(sp_stack, coords_sp_stack)
-        # sp, coords_sp = cp.checkpoint(self.decode, sp_stack, coords_sp_stack)
         spf = self.gs_cube_head(sp.F)  # [N, KxC]
         sp = assign_feats(sp, spf)
         nog_pb = [(self.gpc*sp.C[:,0]==i).sum() for i in range(b)]

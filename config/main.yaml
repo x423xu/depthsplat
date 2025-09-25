@@ -106,3 +106,4 @@ train_controller:
   vggt_meta: false
   backbone: [dino]
   random_scale: false
+  knn_down: false

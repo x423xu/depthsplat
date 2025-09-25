@@ -363,7 +363,7 @@ class AttentionBlock(nn.Module):
 
     def forward(self, x):
         # cell_scale=4: False, cell_scale=8: True
-        return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
+        return checkpoint(self._forward, (x,), self.parameters(),True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
         #return pt_checkpoint(self._forward, x)  # pytorch
 
     def _forward(self, x):

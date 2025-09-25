@@ -162,7 +162,7 @@ def train(cfg_dict: DictConfig):
     encoder, encoder_visualizer = get_encoder(cfg.model.encoder,
                                               gs_cube=cfg.train_controller.gs_cube,
                                               vggt_meta=cfg.train_controller.vggt_meta,
-                                              random_scale=cfg.train_controller.random_scale)
+                                              knn_down=cfg.train_controller.knn_down,)
 
     model_wrapper = ModelWrapper(
         cfg.optimizer,
