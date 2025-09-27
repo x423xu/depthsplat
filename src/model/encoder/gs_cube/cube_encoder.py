@@ -104,6 +104,9 @@ class GSCubeEncoder(Swin3DUNet):
         self.gpc = gpc
         self.cell_scale = cell_scale
         self.cube_merge_type = cube_merge_type
+        self.router = nn.ModuleList()
+        for _ in range(len(depths)+1):
+            self.router.append(nn.Sequential(nn.Linear(channels[-1]), channels[-1]//2),nn.ReLU(),nn.Linear(channels[-1]//2, 1))
 
     def encode(self, sp, coords_sp): 
         # sp: MinkowskiEngine SparseTensor for feature input
@@ -139,13 +142,16 @@ class GSCubeEncoder(Swin3DUNet):
     def decode(self, sp_stack, coords_sp_stack):
         sp = sp_stack.pop()
         coords_sp = coords_sp_stack.pop()
+        sp_out, coords_sp_out = [sp], [coords_sp]
         for i, upsample in enumerate(self.upsamples):
             sp_i = sp_stack.pop()
             coords_sp_i = coords_sp_stack.pop()
             sp = upsample(sp, coords_sp, sp_i, coords_sp_i)
             coords_sp = coords_sp_i
+            sp_out.append(sp)
+            coords_sp_out.append(coords_sp)
 
-        return sp, coords_sp
+        return sp_out, coords_sp_out
 
     # def forward(self, sp, coords_sp):
         
@@ -207,8 +213,15 @@ class GSCubeEncoder(Swin3DUNet):
         # s3: encode
         sp_stack, coords_sp_stack, nog_min = self.encode(gs_cube_input.sp, gs_cube_input.coords_sp)
         # s4: decode
+        sp_list, coords_sp_list = self.decode(sp_stack, coords_sp_stack)
+        # TODO
+        f, gates = [], []
+        for i, (sp, coords_sp) in enumerate(zip(sp_list, coords_sp_list)):
+            router = self.router[i](sp.F)
+            gate = nn.functional.gumbel_softmax(router, tau=1, hard=True)  # Nx1
+            f.append(sp.F)
+            gates.append(gate)
 
-        sp, coords_sp = self.decode(sp_stack, coords_sp_stack)
         spf = self.gs_cube_head(sp.F)  # [N, KxC]
         sp = assign_feats(sp, spf)
         nog_pb = [(self.gpc*sp.C[:,0]==i).sum() for i in range(b)]
