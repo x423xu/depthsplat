@@ -266,7 +266,7 @@ class ModelWrapper(LightningModule):
         gaussians = self.encoder(
             batch["context"], self.global_step, False, scene_names=batch["scene"], random_scale=self.train_controller_cfg.random_scale
         )
-    
+        self.encoder.gs_cube_encoder.gumbel_sigmoid.anneal_linear_(steps_done=self.global_step, steps_total = self.trainer.max_steps)
 
         if isinstance(gaussians, dict):
             if self.gs_cube:
@@ -275,6 +275,7 @@ class ModelWrapper(LightningModule):
                 for i in range(len(nog_pb)):
                     self.log(f"train/nog_pb_{i}", nog_pb[i], prog_bar=True,rank_zero_only=False, on_step=True,sync_dist=False)
                 self.log("train/nog_min", nog_min, prog_bar=True,rank_zero_only=False, on_step=True,sync_dist=False)
+                self.log_dict(gaussians["nog_dict"], prog_bar=True,rank_zero_only=True)
                 # print(f'rank_id:{self.trainer.local_rank}',f'global_step:{self.global_step+1}',batch['scene'], 'nog_pb:', [f'{pb:.4f}' for pb in nog_pb], f'nog_min: {nog_min:.4f}', flush=True)
             pred_depths = gaussians["depths"]
             gaussians = gaussians["gaussians"]

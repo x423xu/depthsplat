@@ -188,7 +188,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                     'channels': [48, 96, 384],
                     'num_heads': [6, 6, 24],
                     'window_sizes': [5, 7, 7],
-                    'num_layers':4,
+                    'num_layers':3,
                 },
                 'small':{
                     'depths': [2, 2],
@@ -410,7 +410,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             # depths = depths.detach()
             # out = out.detach()
 
-            gs_cube,coords_sp_input, input_cube_tensor, input_cube_tensor_perview, nog_pb, nog_min = self.gs_cube_encoder(context["image"], depth, 
+            gs_cube,coords_sp_input, input_cube_tensor, nog_dict, nog_pb, nog_min = self.gs_cube_encoder(context["image"], depth, 
                                             rearrange(out, "(b v) c h w -> b v c h w", b=b, v=v), 
                                             extrinsics = context["extrinsics"], 
                                             intrinsics=context["intrinsics"],
@@ -420,7 +420,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                                             return_perview=False,
                                             conf = match_prob,
                                             random_scale=random_scale)
-            
+            # update gumbel
        
 
             cube_feat = rearrange(gs_cube.F, "n (c gpc) -> n c gpc", gpc=self.gpc)
@@ -515,6 +515,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                 "depths": depths,
                 "nog_pb": nog_pb,
                 "nog_min": nog_min,
+                "nog_dict": nog_dict,
                 }
             return cube_gaussians
         else:    

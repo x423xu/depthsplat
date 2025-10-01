@@ -14,7 +14,7 @@ from einops import rearrange, repeat
 import MinkowskiEngine as ME
 from torch_scatter import scatter_max, scatter_mean, scatter_add, scatter_min
 from Swin3D.modules.mink_layers import assign_feats
-import torch.utils.checkpoint as cp
+import math
 
 class GSCubeInput():
     def __init__(self, feats, coords_centers, positions, imgs, cell_sizes, xyz_min, xyz_max, device='cpu'):
@@ -81,6 +81,94 @@ class GSCubeHead(nn.Module):
         x = self.l1(x)
         return x
 
+class GumbelSigmoid(nn.Module):
+    """
+    Gumbel-Sigmoid (Binary Concrete) gate.
+    
+    Args:
+        tau (float): temperature (>0), lower makes distribution sharper.
+        hard (bool): if True, straight-through estimator (hard {0,1} forward).
+        eps (float): small constant to avoid log(0).
+        clamp (float): optional clamp on logits to avoid extreme values.
+    """
+    def __init__(self, tau: float = 1.0, eps: float = 1e-6, clamp: float = 100.0):
+        super().__init__()
+        self.tau = tau
+        self._hard = False
+        self.eps = eps
+        self.clamp = clamp
+
+    @property
+    def hard(self):
+        return self._hard
+    @hard.setter
+    def hard(self, value: bool):
+        self._hard = bool(value)
+
+    def _sample_gumbel(self, shape, device):
+        u = torch.rand(shape, device=device)
+        u = u.clamp(self.eps, 1.0 - self.eps)
+        return -torch.log(-torch.log(u))  # Gumbel(0,1)
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        # clamp logits for numerical stability
+        if self.clamp is not None:
+            logits = logits.clamp(min=-self.clamp, max=self.clamp)
+
+        if self.hard:
+            # Straight-through estimator
+            y = F.sigmoid(logits)
+            y_hard = (y > 0.5).float()
+            y = y_hard.detach() - y.detach() + y
+        else:
+            # sample gumbel noise
+            g = self._sample_gumbel(logits.shape, logits.device)
+            # relaxed binary sample
+            y = F.sigmoid((logits + g) / self.tau)
+        
+        return y
+
+    # ---------- Scheduling helpers ----------
+    def set_tau_(self, tau: float):
+        """Set tau directly (in-place)."""
+        self.tau = float(tau)
+        return self
+
+    def anneal_exp_(self, gamma: float = 0.99, min_tau: float = 0.1):
+        """
+        Exponential anneal: tau <- max(min_tau, tau * gamma).
+        Call once per step/epoch (your choice).
+        """
+        self.tau = max(min_tau, self.tau * float(gamma))
+        return self
+
+    def anneal_linear_(self, steps_done: int, steps_total: int, start: float = 1.0, end: float = 0.1):
+        """
+        Linear schedule over [0, steps_total].
+        """
+        # last 20% of steps keep tau constant, and use hard
+        if steps_done >= int(0.8*steps_total):
+            self._hard = True
+            return self
+        else:
+            self._hard = False
+            t = min(max(steps_done / max(1, int(0.8*steps_total)), 0.0), 1.0)
+            self.tau = float(start + t * (end - start))
+            return self
+
+    def anneal_cosine_(self, steps_done: int, steps_total: int, start: float = 1.0, end: float = 0.1):
+        """
+        Cosine schedule (smooth): tau = end + (start - end) * 0.5 * (1 + cos(pi * progress)).
+        """
+        # last 20% of steps keep tau constant, and use hard
+        if steps_done >= int(0.8*steps_total):
+            self._hard = True
+            return self
+        else:
+            self._hard = False
+            progress = min(max(steps_done / max(1, int(0.8*steps_total)), 0.0), 1.0)
+            self.tau = float(end + (start - end) * 0.5 * (1 + math.cos(math.pi * progress)))
+            return self
 class GSCubeEncoder(Swin3DUNet):
     def __init__(
             self, depths, channels, num_heads, window_sizes,
@@ -104,9 +192,23 @@ class GSCubeEncoder(Swin3DUNet):
         self.gpc = gpc
         self.cell_scale = cell_scale
         self.cube_merge_type = cube_merge_type
+        self.gumbel_sigmoid = GumbelSigmoid(tau=1.0)
+        # self.gumbel_sigmoid.hard = True
+        
+        self.strides = down_strides
         self.router = nn.ModuleList()
-        for _ in range(len(depths)+1):
-            self.router.append(nn.Sequential(nn.Linear(channels[-1]), channels[-1]//2),nn.ReLU(),nn.Linear(channels[-1]//2, 1))
+        for i in range(1, len(depths)):
+            router_i= nn.Sequential(nn.Linear(channels[-i], channels[-i]//2),nn.ReLU(),nn.Linear(channels[-i]//2, 1))
+            # zero intialization
+            for m in router_i.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.zeros_(m.weight)
+                    nn.init.zeros_(m.bias)
+            self.router.append(router_i)
+
+        self.mapping = nn.ModuleList()
+        for i in range(1, len(depths)):
+            self.mapping.append(nn.Sequential(nn.Linear(channels[-i], channels[0])))
 
     def encode(self, sp, coords_sp): 
         # sp: MinkowskiEngine SparseTensor for feature input
@@ -124,6 +226,7 @@ class GSCubeEncoder(Swin3DUNet):
         # coords_sp.C: input coordinates: Nx4
         sp_stack = []
         coords_sp_stack = []
+        downsample_map_stack = []
         sp = self.stem_layer(sp)
         if self.layer_start > 0:
             sp_stack.append(sp)
@@ -132,26 +235,183 @@ class GSCubeEncoder(Swin3DUNet):
 
         for i, layer in enumerate(self.layers):
             coords_sp_stack.append(coords_sp)
-            sp, sp_down, coords_sp = layer(sp, coords_sp)
-            # sp_down, coords_sp, sp = cp.checkpoint(layer, sp, coords_sp)
-            sp_stack.append(sp)
+            if i<len(self.layers)-1:
+                sp, sp_down, coords_sp, downsample_map = layer(sp, coords_sp, return_map=True)
+                downsample_map_stack.append(downsample_map)
+            else:
+                sp, sp_down, coords_sp = layer(sp, coords_sp)
+            sp_stack.append(sp) 
             assert (coords_sp.C == sp_down.C).all()
             sp = sp_down
-        return sp_stack, coords_sp_stack, sp_down.C.shape[0]       
+        return sp_stack, coords_sp_stack, sp_down.C.shape[0], downsample_map_stack
 
-    def decode(self, sp_stack, coords_sp_stack):
+    def _spawn_sons(self, sp, coords_sp, gate):
+         # the voxel with 1 denotes the ending voxel
+        gate_end_ind = torch.where(gate[:,0]>=0.5)[0]
+        gate_alive_ind = torch.where(gate[:,0]<0.5)[0]
+        if gate_end_ind.shape[0] == 0:
+            return None, None, sp, coords_sp, gate_end_ind, gate_alive_ind
+        sp_end = ME.SparseTensor(
+            features=sp.F[gate_end_ind,:],
+            coordinates=sp.C[gate_end_ind,:],
+            device=sp.device,
+            coordinate_manager=sp.coordinate_manager,
+            tensor_stride=sp.tensor_stride,
+            # coordinate_map_key=sp.coordinate_map_key
+        )
+        coords_sp_end = ME.SparseTensor(
+            features=coords_sp.F[gate_end_ind,:],
+            coordinates=coords_sp.C[gate_end_ind,:],
+            device=coords_sp.device,
+            coordinate_manager=coords_sp.coordinate_manager,
+            tensor_stride=coords_sp.tensor_stride,
+            # coordinate_map_key=coords_sp.coordinate_map_key
+        )
+
+        
+        sp_alive = ME.SparseTensor(
+            features=sp.F[gate_alive_ind,:],
+            coordinates=sp.C[gate_alive_ind,:],
+            device=sp.device,
+            coordinate_manager=sp.coordinate_manager,
+            tensor_stride=sp.tensor_stride,
+        )
+        coords_sp_alive = ME.SparseTensor(
+            features=coords_sp.F[gate_alive_ind,:],
+            coordinates=coords_sp.C[gate_alive_ind,:],
+            device=coords_sp.device,
+            coordinate_manager=coords_sp.coordinate_manager,
+            tensor_stride=coords_sp.tensor_stride,
+        )
+        return sp_end, coords_sp_end, sp_alive, coords_sp_alive, gate_end_ind, gate_alive_ind
+
+    def _align_coordinate(self, sp_i, coords_sp_i, gate_alive_ind, out_map, new_mask=None):
+        # only keep the coordinates that are in sp_alive
+        if new_mask is None:
+            mask = torch.isin(out_map, gate_alive_ind)
+            select_ind = torch.where(mask)[0]
+            select_ind_inverse = -1*torch.ones_like(out_map, dtype=torch.long)
+            select_ind_inverse[select_ind] = torch.arange(select_ind.shape[0], device=select_ind.device)
+            sp_i_c = sp_i.C[select_ind]
+            sp_i_f = sp_i.F[select_ind]
+            sp_i = ME.SparseTensor(
+                features=sp_i_f,
+                coordinates=sp_i_c,
+                device=sp_i.device,
+                coordinate_manager=sp_i.coordinate_manager,
+                tensor_stride=sp_i.tensor_stride,
+            )
+
+            coords_sp_i_c = coords_sp_i.C[select_ind]
+            coords_sp_i_f = coords_sp_i.F[select_ind]
+            coords_sp_i = ME.SparseTensor(
+                features=coords_sp_i_f,
+                coordinates=coords_sp_i_c,
+                device=coords_sp_i.device,
+                coordinate_manager=coords_sp_i.coordinate_manager,
+                tensor_stride=coords_sp_i.tensor_stride,
+            )
+        else:
+            mask = torch.isin(out_map, gate_alive_ind)
+            select_ind = torch.where(mask)[0]
+            select_ind_inverse = -1*torch.ones_like(out_map, dtype=torch.long)
+            select_ind_inverse[select_ind] = torch.arange(select_ind.shape[0], device=select_ind.device)
+            sp_i_c = sp_i.C[new_mask][select_ind]
+            sp_i_f = sp_i.F[new_mask][select_ind]
+            sp_i = ME.SparseTensor(
+                features=sp_i_f,
+                coordinates=sp_i_c,
+                device=sp_i.device,
+                coordinate_manager=sp_i.coordinate_manager,
+                tensor_stride=sp_i.tensor_stride,
+            )
+
+            coords_sp_i_c = coords_sp_i.C[new_mask][select_ind]
+            coords_sp_i_f = coords_sp_i.F[new_mask][select_ind]
+            coords_sp_i = ME.SparseTensor(
+                features=coords_sp_i_f,
+                coordinates=coords_sp_i_c,
+                device=coords_sp_i.device,
+                coordinate_manager=coords_sp_i.coordinate_manager,
+                tensor_stride=coords_sp_i.tensor_stride,
+            )
+        return sp_i, coords_sp_i, mask, select_ind, select_ind_inverse
+
+    # downsample_map: fine to coarse, L-1
+    # sp_stack: coarse to fine, L
+    # coords_sp_stack: coarse to fine, L
+    # self.router: coarse to fine, L
+    def decode(self, sp_stack, coords_sp_stack, downsample_map_stack):
+        '''
+        step1: for the coarsest voxel, determine whether it is the ending voxel or not.
+        if it is alive, then keep upsampling.
+        at the same time, we need to know the finer voxel's coordinates corresponding to the alive voxels
+        '''
         sp = sp_stack.pop()
         coords_sp = coords_sp_stack.pop()
-        sp_out, coords_sp_out = [sp], [coords_sp]
+        router_coarsest = self.router[0](sp.F)
+        gate_coarsest = self.gumbel_sigmoid(router_coarsest)
+        sp_end, coords_sp_end, sp_alive, coords_sp_alive, gate_end_ind, gate_alive_ind = self._spawn_sons(sp, coords_sp, gate_coarsest)
+        sp_out = []
+        nog_dict = {}
+        # select_ind_list = []
+        sp_out, coords_sp_out = [], []
+        if sp_end is not None:
+            sp_out.append([sp_end.C,self.mapping[0](sp_end.F)])
+            coords_sp_out.append(coords_sp_end)
+            nog_dict.update({'end_ratio_0': sp_end.C.shape[0]/(sp_end.C.shape[0]+sp_alive.C.shape[0])})
+        else:
+            nog_dict.update({'end_ratio_0': 0.0})
+        new_mask=None
         for i, upsample in enumerate(self.upsamples):
             sp_i = sp_stack.pop()
             coords_sp_i = coords_sp_stack.pop()
-            sp = upsample(sp, coords_sp, sp_i, coords_sp_i)
-            coords_sp = coords_sp_i
-            sp_out.append(sp)
-            coords_sp_out.append(coords_sp)
+            downsample_map = downsample_map_stack.pop()
+            out_map = downsample_map[1]
+            if i>0:
+                new_mask = select_mask[out_map]
+                out_map_i = out_map[new_mask]
+                out_map = select_ind_inverse[out_map_i]
+                assert (out_map>-1).all()
+            sp_i_alive, coords_sp_i_alive, select_mask, select_ind, select_ind_inverse = self._align_coordinate(sp_i, coords_sp_i, gate_alive_ind, out_map, new_mask=new_mask) #TODO
+            sp = upsample(sp_alive, coords_sp_alive, sp_i_alive, coords_sp_i_alive)
+            coords_sp = coords_sp_i_alive  
+            if i < len(self.upsamples)-1:
+                router = self.router[i+1](sp.F)
+                gate = self.gumbel_sigmoid(router)
+                sp_end, coords_sp_end, sp_alive, coords_sp_alive, gate_end_ind, gate_alive_ind = self._spawn_sons(sp, coords_sp, gate)
+                if sp_end is not None:
+                    sp_out.append([sp_end.C,self.mapping[i+1](sp_end.F)])
+                    coords_sp_out.append(coords_sp_end)
+                    nog_dict.update({'end_ratio_{}'.format(i+1): sp_end.C.shape[0]/(sp_end.C.shape[0]+sp_alive.C.shape[0])})
+                else:
+                    nog_dict.update({'end_ratio_{}'.format(i+1): 0.0})
+            else:
+                sp_out.append([sp.C,sp.F])
+                coords_sp_out.append(coords_sp)
+                nog_dict.update({'end_ratio_final': sp.C.shape[0]/(sp.C.shape[0]+0)})
 
-        return sp_out, coords_sp_out
+        f_out = torch.cat([f for _,f in sp_out],dim=0)
+        coords = torch.cat([c for c,_ in sp_out],dim=0)
+        sp = ME.SparseTensor(
+            features=f_out,
+            coordinates=coords,
+            device=sp.device,
+            coordinate_manager=sp.coordinate_manager,
+            tensor_stride=sp.tensor_stride,
+        )
+
+        coords_f = torch.cat([c.F for c in coords_sp_out],dim=0)
+        coords_c = torch.cat([c.C for c in coords_sp_out],dim=0)
+        coords_sp = ME.SparseTensor(
+            features=coords_f,
+            coordinates=coords_c,
+            coordinate_manager = coords_sp.coordinate_manager,
+            device=coords_sp.device,
+            tensor_stride=coords_sp.tensor_stride,
+        )
+
+        return sp, coords_sp, nog_dict
 
     # def forward(self, sp, coords_sp):
         
@@ -211,26 +471,16 @@ class GSCubeEncoder(Swin3DUNet):
         #               rearrange(imgs,"b v c h w -> b (v h w) c"), 
         #               num_depth, b=b, v=v, h=h, w=w, return_perview=return_perview)
         # s3: encode
-        sp_stack, coords_sp_stack, nog_min = self.encode(gs_cube_input.sp, gs_cube_input.coords_sp)
+        sp_stack, coords_sp_stack, nog_min, downsample_map_stack = self.encode(gs_cube_input.sp, gs_cube_input.coords_sp)
         # s4: decode
-        sp_list, coords_sp_list = self.decode(sp_stack, coords_sp_stack)
-        # TODO
-        f, gates = [], []
-        for i, (sp, coords_sp) in enumerate(zip(sp_list, coords_sp_list)):
-            router = self.router[i](sp.F)
-            gate = nn.functional.gumbel_softmax(router, tau=1, hard=True)  # Nx1
-            f.append(sp.F)
-            gates.append(gate)
-
+        sp, coords_sp, nog_dict = self.decode(sp_stack, coords_sp_stack, downsample_map_stack)
         spf = self.gs_cube_head(sp.F)  # [N, KxC]
         sp = assign_feats(sp, spf)
         nog_pb = [(self.gpc*sp.C[:,0]==i).sum() for i in range(b)]
         # nog_pv = self.gpc*sp.C.shape[0]//(b * v)
         nog_min = nog_min // b
 
-        if return_perview:
-            return sp, coords_sp, gs_cube_input, gs_cube_input_perview, nog_pb, nog_min
-        return sp, gs_cube_input.coords_sp, gs_cube_input, None, nog_pb, nog_min
+        return sp, coords_sp, gs_cube_input, nog_dict, nog_pb, nog_min
 
     '''
     coords: Nx3
