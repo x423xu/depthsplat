@@ -169,6 +169,21 @@ class GumbelSigmoid(nn.Module):
             progress = min(max(steps_done / max(1, int(0.8*steps_total)), 0.0), 1.0)
             self.tau = float(end + (start - end) * 0.5 * (1 + math.cos(math.pi * progress)))
             return self
+
+
+class ZeroStartLinear(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.inner = nn.Linear(in_dim, out_dim)
+        # normal nonzero init so inner(x) ≠ 0
+        nn.init.kaiming_uniform_(self.inner.weight, a=0.0)
+        if self.inner.bias is not None:
+            nn.init.zeros_(self.inner.bias)
+        self.scale = nn.Parameter(torch.tensor(0.0))  # <- starts at 0
+
+    def forward(self, x):
+        return self.scale * self.inner(x)
+    
 class GSCubeEncoder(Swin3DUNet):
     def __init__(
             self, depths, channels, num_heads, window_sizes,
@@ -192,18 +207,18 @@ class GSCubeEncoder(Swin3DUNet):
         self.gpc = gpc
         self.cell_scale = cell_scale
         self.cube_merge_type = cube_merge_type
-        self.gumbel_sigmoid = GumbelSigmoid(tau=1.0)
-        # self.gumbel_sigmoid.hard = True
+        self.gumbel_sigmoid = GumbelSigmoid(tau=0.4)
+        self.gumbel_sigmoid.hard = True
         
         self.strides = down_strides
         self.router = nn.ModuleList()
         for i in range(1, len(depths)):
             router_i= nn.Sequential(nn.Linear(channels[-i], channels[-i]//2),nn.ReLU(),nn.Linear(channels[-i]//2, 1))
-            # zero intialization
-            for m in router_i.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.zeros_(m.weight)
-                    nn.init.zeros_(m.bias)
+            # for m in router_i.modules():
+            #     if isinstance(m, nn.Linear):
+            #         nn.init.zeros_(m.weight)
+            #         if m.bias is not None:
+            #             nn.init.zeros_(m.bias)
             self.router.append(router_i)
 
         self.mapping = nn.ModuleList()
@@ -247,12 +262,44 @@ class GSCubeEncoder(Swin3DUNet):
 
     def _spawn_sons(self, sp, coords_sp, gate):
          # the voxel with 1 denotes the ending voxel
-        gate_end_ind = torch.where(gate[:,0]>=0.5)[0]
-        gate_alive_ind = torch.where(gate[:,0]<0.5)[0]
+        gate_end_ind = torch.where(gate[:,0]<0.5)[0]
+        gate_alive_ind = torch.where(gate[:,0]>=0.5)[0]
         if gate_end_ind.shape[0] == 0:
-            return None, None, sp, coords_sp, gate_end_ind, gate_alive_ind
+            sp_alive = ME.SparseTensor(
+            features=sp.F[gate_alive_ind,:] * gate[gate_alive_ind,:],
+            coordinates=sp.C[gate_alive_ind,:],
+            device=sp.device,
+            coordinate_manager=sp.coordinate_manager,
+            tensor_stride=sp.tensor_stride,
+            )
+            coords_sp_alive = ME.SparseTensor(
+                features=coords_sp.F[gate_alive_ind,:],
+                coordinates=coords_sp.C[gate_alive_ind,:],
+                device=coords_sp.device,
+                coordinate_manager=coords_sp.coordinate_manager,
+                tensor_stride=coords_sp.tensor_stride,
+            ) 
+            return None, None, sp_alive, coords_sp_alive, gate_end_ind, gate_alive_ind
+        if gate_alive_ind.shape[0] == 0:
+            sp_end = ME.SparseTensor(
+            features=sp.F[gate_end_ind,:]*gate[gate_end_ind,:],
+            coordinates=sp.C[gate_end_ind,:],
+            device=sp.device,
+            coordinate_manager=sp.coordinate_manager,
+            tensor_stride=sp.tensor_stride,
+            # coordinate_map_key=sp.coordinate_map_key
+            )
+            coords_sp_end = ME.SparseTensor(
+                features=coords_sp.F[gate_end_ind,:],
+                coordinates=coords_sp.C[gate_end_ind,:],
+                device=coords_sp.device,
+                coordinate_manager=coords_sp.coordinate_manager,
+                tensor_stride=coords_sp.tensor_stride,
+                # coordinate_map_key=coords_sp.coordinate_map_key
+            )
+            return sp_end, coords_sp_end, None, None, gate_end_ind, gate_alive_ind
         sp_end = ME.SparseTensor(
-            features=sp.F[gate_end_ind,:],
+            features=sp.F[gate_end_ind,:]*gate[gate_end_ind,:],
             coordinates=sp.C[gate_end_ind,:],
             device=sp.device,
             coordinate_manager=sp.coordinate_manager,
@@ -270,7 +317,7 @@ class GSCubeEncoder(Swin3DUNet):
 
         
         sp_alive = ME.SparseTensor(
-            features=sp.F[gate_alive_ind,:],
+            features=sp.F[gate_alive_ind,:] * gate[gate_alive_ind,:],
             coordinates=sp.C[gate_alive_ind,:],
             device=sp.device,
             coordinate_manager=sp.coordinate_manager,
@@ -282,7 +329,7 @@ class GSCubeEncoder(Swin3DUNet):
             device=coords_sp.device,
             coordinate_manager=coords_sp.coordinate_manager,
             tensor_stride=coords_sp.tensor_stride,
-        )
+        )   
         return sp_end, coords_sp_end, sp_alive, coords_sp_alive, gate_end_ind, gate_alive_ind
 
     def _align_coordinate(self, sp_i, coords_sp_i, gate_alive_ind, out_map, new_mask=None):
@@ -341,17 +388,23 @@ class GSCubeEncoder(Swin3DUNet):
     # sp_stack: coarse to fine, L
     # coords_sp_stack: coarse to fine, L
     # self.router: coarse to fine, L
+    def _get_gate(self, sp, router):
+        router_out = router(sp.F)
+        gate = self.gumbel_sigmoid(router_out)
+        return gate
+    
     def decode(self, sp_stack, coords_sp_stack, downsample_map_stack):
         '''
         step1: for the coarsest voxel, determine whether it is the ending voxel or not.
         if it is alive, then keep upsampling.
         at the same time, we need to know the finer voxel's coordinates corresponding to the alive voxels
         '''
+        # print((self.router[0][-1].weight==0).all())
         sp = sp_stack.pop()
         coords_sp = coords_sp_stack.pop()
-        router_coarsest = self.router[0](sp.F)
-        gate_coarsest = self.gumbel_sigmoid(router_coarsest)
+        gate_coarsest = self._get_gate(sp, self.router[0])
         sp_end, coords_sp_end, sp_alive, coords_sp_alive, gate_end_ind, gate_alive_ind = self._spawn_sons(sp, coords_sp, gate_coarsest)
+        # print(f'layer{0}: {(sp_alive.C[:,0]==0).sum()}/{sp_alive.C.shape[0]} | {(sp_alive.C[:,0]==1).sum()}/{sp_alive.C.shape[0]}')
         sp_out = []
         nog_dict = {}
         # select_ind_list = []
@@ -359,11 +412,16 @@ class GSCubeEncoder(Swin3DUNet):
         if sp_end is not None:
             sp_out.append([sp_end.C,self.mapping[0](sp_end.F)])
             coords_sp_out.append(coords_sp_end)
-            nog_dict.update({'end_ratio_0': sp_end.C.shape[0]/(sp_end.C.shape[0]+sp_alive.C.shape[0])})
+            if sp_alive is None:
+                nog_dict.update({'end_nog_0': sp_end.C.shape[0]})
+            else:
+                nog_dict.update({'end_nog_0': sp_end.C.shape[0], 'alive_nog_0': sp_alive.C.shape[0], 'end_ratio_0': sp_end.C.shape[0] / (sp_end.C.shape[0] + sp_alive.C.shape[0])})
         else:
-            nog_dict.update({'end_ratio_0': 0.0})
+            nog_dict.update({'alive_nog_0': sp_alive.C.shape[0]})
         new_mask=None
         for i, upsample in enumerate(self.upsamples):
+            if sp_alive is None:
+                break
             sp_i = sp_stack.pop()
             coords_sp_i = coords_sp_stack.pop()
             downsample_map = downsample_map_stack.pop()
@@ -377,19 +435,22 @@ class GSCubeEncoder(Swin3DUNet):
             sp = upsample(sp_alive, coords_sp_alive, sp_i_alive, coords_sp_i_alive)
             coords_sp = coords_sp_i_alive  
             if i < len(self.upsamples)-1:
-                router = self.router[i+1](sp.F)
-                gate = self.gumbel_sigmoid(router)
+                gate = self._get_gate(sp, self.router[i+1])
                 sp_end, coords_sp_end, sp_alive, coords_sp_alive, gate_end_ind, gate_alive_ind = self._spawn_sons(sp, coords_sp, gate)
+                # print(f'layer{i+1}: {(sp_alive.C[:,0]==0).sum()}/{sp_alive.C.shape[0]} | {(sp_alive.C[:,0]==1).sum()}/{sp_alive.C.shape[0]}')
                 if sp_end is not None:
                     sp_out.append([sp_end.C,self.mapping[i+1](sp_end.F)])
                     coords_sp_out.append(coords_sp_end)
-                    nog_dict.update({'end_ratio_{}'.format(i+1): sp_end.C.shape[0]/(sp_end.C.shape[0]+sp_alive.C.shape[0])})
+                    if sp_alive is None:
+                        nog_dict.update({'end_nog_{}'.format(i+1): sp_end.C.shape[0]})
+                    else:
+                        nog_dict.update({'end_nog_{}'.format(i+1): sp_end.C.shape[0], 'alive_nog_{}'.format(i+1): sp_alive.C.shape[0], 'end_ratio_{}'.format(i+1): sp_end.C.shape[0] / (sp_end.C.shape[0] + sp_alive.C.shape[0])})
                 else:
-                    nog_dict.update({'end_ratio_{}'.format(i+1): 0.0})
+                    nog_dict.update({'alive_nog_{}'.format(i+1): sp_alive.C.shape[0]})
             else:
                 sp_out.append([sp.C,sp.F])
                 coords_sp_out.append(coords_sp)
-                nog_dict.update({'end_ratio_final': sp.C.shape[0]/(sp.C.shape[0]+0)})
+                nog_dict.update({'end_nog_final': sp.C.shape[0]})
 
         f_out = torch.cat([f for _,f in sp_out],dim=0)
         coords = torch.cat([c for c,_ in sp_out],dim=0)

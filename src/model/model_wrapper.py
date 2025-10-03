@@ -112,6 +112,23 @@ class TrajectoryFn(Protocol):
     ]:
         pass
 
+global_grad_in = None
+global_grad_out = None
+def backward_hook(module, grad_input, grad_output):
+    print(f'In {module.__class__.__name__} backward')
+    print(f'grad_input: {type(grad_input)}')
+    print(f'grad_output: {type(grad_output)}')
+    global global_grad_in, global_grad_out
+    global_grad_in = grad_input
+    global_grad_out = grad_output
+
+global_input_tensor = None
+global_output_tensor = None
+def fwd_hook(mod, inp, out):
+    # inp and out can be tuples; linear has single tensor in/out
+    global global_input_tensor, global_output_tensor
+    global_input_tensor = inp[0].detach()
+    global_output_tensor = out.detach()
 
 class ModelWrapper(LightningModule):
     logger: Optional[WandbLogger]
@@ -176,6 +193,8 @@ class ModelWrapper(LightningModule):
             self.test_step_outputs = {}
             self.time_skip_steps_dict = {"encoder": 0, "decoder": 0}
 
+        # self.automatic_optimization = False
+
 
     def _handle_oom(self, where: str):
         # free up as much as we can so the next batch can proceed
@@ -191,11 +210,15 @@ class ModelWrapper(LightningModule):
         opt = self.optimizers()
         # ---- FORWARD ----
         fwd_ok = torch.tensor(1, device=self.device, dtype=torch.int)
+        # for n,m in self.encoder.gs_cube_encoder.named_modules():
+        #     if 'router.1.2' in n:
+        #         target_model = m
+        # back_hook = target_model.register_full_backward_hook(backward_hook)
+        # forward_hook = target_model.register_forward_hook(fwd_hook)
         try:
-            total_loss = self.forward(batch, batch_idx)
-
+            total_loss = self.forward(batch, batch_idx)   
             # scheduler = self.lr_schedulers()
-            # # ---- BACKWARD ---- debug nan
+            # # # ---- BACKWARD ---- debug nan
             # self.manual_backward(total_loss)
             # nan=0
             # for n,p in self.named_parameters():
@@ -211,6 +234,8 @@ class ModelWrapper(LightningModule):
             # opt.step()
             # opt.zero_grad()
             # scheduler.step()
+            # back_hook.remove()
+            # forward_hook.remove()
                 
         except torch.cuda.OutOfMemoryError as e:
             self._handle_oom("training_step")
@@ -275,7 +300,8 @@ class ModelWrapper(LightningModule):
                 for i in range(len(nog_pb)):
                     self.log(f"train/nog_pb_{i}", nog_pb[i], prog_bar=True,rank_zero_only=False, on_step=True,sync_dist=False)
                 self.log("train/nog_min", nog_min, prog_bar=True,rank_zero_only=False, on_step=True,sync_dist=False)
-                self.log_dict(gaussians["nog_dict"], prog_bar=True,rank_zero_only=True)
+                # self.log_dict(gaussians["nog_dict"], prog_bar=True,rank_zero_only=True)
+                print(gaussians["nog_dict"])
                 # print(f'rank_id:{self.trainer.local_rank}',f'global_step:{self.global_step+1}',batch['scene'], 'nog_pb:', [f'{pb:.4f}' for pb in nog_pb], f'nog_min: {nog_min:.4f}', flush=True)
             pred_depths = gaussians["depths"]
             gaussians = gaussians["gaussians"]
