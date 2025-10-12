@@ -270,6 +270,9 @@ class DatasetRE10k(IterableDataset):
             for run_idx in range(int(times_per_scene * len(chunk))):
                 example = chunk[run_idx // times_per_scene]
                 extrinsics, intrinsics = self.convert_poses(example["cameras"])
+                # import numpy as np
+                # d = np.linalg.norm(np.diff(extrinsics[:,:3,3], axis=0), axis=1)
+                # b = np.median(d)
                 scene = example["key"]
 
                 if self.vggt_meta:
@@ -295,6 +298,9 @@ class DatasetRE10k(IterableDataset):
                 except ValueError:
                     # Skip because the example doesn't have enough frames.
                     continue
+                    
+                # debug
+                # context_indices = torch.tensor([22,31, 42,51, 65,76,97, 103, 117], dtype=torch.long,device=context_indices.device)
 
                 # Skip the example if the field of view is too wide.
                 if self.vggt_meta:
@@ -536,6 +542,8 @@ class DatasetRE10k(IterableDataset):
 
     def __len__(self) -> int:
         if self.cfg.overfit_to_scene is not None:
+            if self.stage == "test":
+                return 1
             return 10000
         return (
             min(len(self.index.keys()), self.cfg.test_len)

@@ -82,6 +82,37 @@
             ]
         },
         {
+            "name": "Train depthsplat+any",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.main",
+            // "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "8",
+                // "MASTER_ADDR": "localhost",
+                // "MASTER_PORT": "12345",
+            },
+            "args": [
+                "+experiment=re10k",
+                "dataset.roots=[/data0/xxy/data/re10k]",
+                "data_loader.train.batch_size=2",
+                "wandb.mode=disabled",
+                "dataset.test_chunk_interval=100",
+                "trainer.max_steps=100000",
+                "model.encoder.upsample_factor=4",
+                "model.encoder.lowest_feature_resolution=4",
+                "checkpointing.pretrained_model=/data0/xxy/code/depthsplat/checkpoints/re10k-256x256-depthsplat-small/checkpoints/epoch_27-step_300000.ckpt",
+                "checkpointing.pretrained_monodepth=pretrained/depth_anything_v2_vits.pth",
+                "checkpointing.pretrained_mvdepth=pretrained/gmflow-scale1-things-e9887eda.pth",
+                "output_dir=checkpoints/depthsplat-anysplat",
+                "train_controller.gaussian_merge=true",
+                "train_controller.base_model=true",
+                "trainer.val_check_interval=0.05",
+            ]
+        },
+        {
             "name": "Train re10k 256x256 unbounded",
             "type": "debugpy",
             "request": "launch",

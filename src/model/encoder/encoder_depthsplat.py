@@ -24,6 +24,8 @@ from .unimatch.mv_unimatch import MultiViewUniMatch
 from .unimatch.dpt_head import DPTHead
 
 import MinkowskiEngine as ME
+from torch_scatter.composite import scatter_softmax
+from torch_scatter import scatter_add
 
 DEBUG = False
 
@@ -80,16 +82,98 @@ class EncoderDepthSplatCfg:
     cube_encoder_type: str  # small, base, large
     cube_merge_type: str
 
+class GaussianSpaceMerger(nn.Module):
+    def __init__(self, d_in, d_out, voxel_size = 0.001):
+        super().__init__()
+        self.linear = nn.Linear(d_in, d_out)
+        self.norm = nn.LayerNorm(d_out)
+        self.voxel_size = voxel_size
 
+    def forward(self, scores, gaussians):
+        # s1: voxelization
+        means = gaussians.means
+        covariances = gaussians.covariances
+        harmonics = gaussians.harmonics
+        opacities = gaussians.opacities
+
+        means_min, mean_max = means.min(), means.max()
+        means_normlized = (means - means_min) / (mean_max - means_min + 1e-6)
+        voxel_num = int((mean_max - means_min) / self.voxel_size) + 1
+        voxel_num = min(voxel_num, 1000) 
+        voxel_indices = torch.clamp((means_normlized * voxel_num).long(), 0, voxel_num - 1)
+        # voxel_indicies_2 = voxel_indices[..., 0] * voxel_num * voxel_num + voxel_indices[..., 1] * voxel_num + voxel_indices[..., 2]
+        max_len = 1
+        means_list = []
+        covariances_list = []
+        harmonics_list = []
+        opacities_list = []
+        for batch_idx in range(scores.shape[0]):
+            score_b = scores[batch_idx]
+            ind_b = voxel_indices[batch_idx]
+            unique_ind_b,inverse_ind = torch.unique(ind_b,
+                                                    dim=0, 
+                                                    return_inverse=True,)
+            means_b = means[batch_idx]
+            covariances_b = covariances[batch_idx]
+            harmonics_b = harmonics[batch_idx]
+            opacities_b = opacities[batch_idx]
+            score_b_soft_max = scatter_softmax(score_b, inverse_ind, dim=0)
+            means_b_sum = scatter_add(means_b * score_b_soft_max, inverse_ind, dim=0, dim_size=unique_ind_b.shape[0])
+            covariances_b_sum = scatter_add(covariances_b * score_b_soft_max.unsqueeze(-1), inverse_ind, dim=0, dim_size=unique_ind_b.shape[0])
+            harmonics_b_sum = scatter_add(harmonics_b * score_b_soft_max.unsqueeze(-1), inverse_ind, dim=0, dim_size=unique_ind_b.shape[0])
+            opacities_b_sum = scatter_add(opacities_b * score_b_soft_max.squeeze(-1), inverse_ind, dim=0, dim_size=unique_ind_b.shape[0])
+            means_list.append(means_b_sum)
+            covariances_list.append(covariances_b_sum)
+            harmonics_list.append(harmonics_b_sum)
+            opacities_list.append(opacities_b_sum)
+            if unique_ind_b.shape[0] > max_len:
+                max_len = unique_ind_b.shape[0]
+        new_means,new_covariances,new_harmonics,new_opacities = [],[],[],[]
+        for means, covariances, harmonics, opacities in zip(means_list, covariances_list, harmonics_list, opacities_list):
+            pad_len = max_len - means.shape[0]
+            if pad_len > 0:
+                means = F.pad(means, (0, 0, 0, pad_len), mode='constant', value=0)
+                covariances = F.pad(covariances, (0, 0, 0, 0, 0, pad_len), mode='constant', value=0)
+                harmonics = F.pad(harmonics, (0, 0, 0, 0, 0, pad_len), mode='constant', value=0)
+                opacities = F.pad(opacities, (0, pad_len), mode='constant', value=0)
+            new_means.append(means)
+            new_covariances.append(covariances)
+            new_harmonics.append(harmonics)
+            new_opacities.append(opacities)
+        new_means = torch.stack(new_means, dim=0)
+        new_covariances = torch.stack(new_covariances, dim=0)
+        new_harmonics = torch.stack(new_harmonics, dim=0)
+        new_opacities = torch.stack(new_opacities, dim=0)
+
+        gaussian_out = Gaussians(new_means, new_covariances, new_harmonics, new_opacities)
+        return gaussian_out
+class GaussianScorer(nn.Module):
+    def __init__(self, d_in, d_out):
+        super().__init__()
+        self.scorer = nn.Sequential(
+                nn.Conv2d(d_in, 64,
+                          3, 1, 1, padding_mode='replicate'),
+                nn.GELU(),
+                nn.Conv2d(64,
+                          d_out, 3, 1, 1, padding_mode='replicate')
+            )
+
+    def forward(self, x):
+        # s1: voxelization
+        x = self.scorer(x)
+        return x
+    
 class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
     def __init__(self, 
                  cfg: EncoderDepthSplatCfg, 
                  gs_cube:bool = False,
                  vggt_meta:bool = False,
-                 knn_down:bool=False) -> None:
+                 knn_down:bool=False,
+                 gaussian_merge:bool=False) -> None:
         super().__init__(cfg)
 
         self.vggt_meta = vggt_meta
+        
 
         self.depth_predictor = MultiViewUniMatch(
             num_scales=cfg.num_scales,
@@ -154,6 +238,12 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             nn.init.zeros_(self.gaussian_head[-1].weight[10:])
             nn.init.zeros_(self.gaussian_head[-1].bias[10:])
 
+
+        # anysplat merge 
+        self.gaussian_merge = gaussian_merge
+        if self.gaussian_merge:
+            self.gaussian_merger = GaussianSpaceMerger(num_gaussian_parameters, num_gaussian_parameters)
+            self.gaussian_scorer = GaussianScorer(in_channels, 1)
         # init scale
         # first 3: opacity, offset_xy
         if self.vggt_meta:
@@ -520,6 +610,9 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         else:    
             gaussians = self.gaussian_head(out)  # [BV, C, H, W]
             gaussians = rearrange(gaussians, "(b v) c h w -> b v c h w", b=b, v=v)
+            if self.gaussian_merge:
+                gaussian_scores = self.gaussian_scorer(out)
+                gaussian_scores = rearrange(gaussian_scores, "(b v) l h w -> b (v h w) l", b=b, v=v)
             # [B, V, H*W, 1, 1]
             densities = rearrange(
                 match_prob, "(b v) c h w -> b v (c h w) () ()", b=b, v=v)
@@ -655,6 +748,9 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                     "b v r srf spp -> b (v r srf spp)",
                 ),
             )
+
+            if self.gaussian_merge:
+                gaussians = self.gaussian_merger(gaussian_scores, gaussians)
 
             
             if self.cfg.return_depth:

@@ -165,7 +165,7 @@ class ModelWrapper(LightningModule):
         self.vggt_meta = train_controller_cfg.vggt_meta if train_controller_cfg else False
         if not train_controller_cfg.base_model:
             for name, param in self.encoder.named_parameters():
-                if not "gs_cube_encoder" in name:
+                if ("gs_cube_encoder"  not in name) and ("gaussian_merger" not in name) and ("gaussian_scorer" not in name):
                     param.requires_grad = False
 
         # This is used for testing.
@@ -175,6 +175,9 @@ class ModelWrapper(LightningModule):
         if self.test_cfg.compute_scores:
             self.test_step_outputs = {}
             self.time_skip_steps_dict = {"encoder": 0, "decoder": 0}
+            self.nog = []
+            # self.test_step_output_dict = {}
+            # self.test_length_dict = {}
 
 
     def _handle_oom(self, where: str):
@@ -482,6 +485,19 @@ class ModelWrapper(LightningModule):
     def test_step(self, batch, batch_idx):
         # torch.cuda.empty_cache()
         batch: BatchedExample = self.data_shim(batch)
+
+        # # get move length
+        # P = batch["context"]['extrinsics'][0].cpu().numpy() # V,4,4
+        # C = P[:,:3,3]
+        # diffs = np.diff(C, axis=0) # V-1,3
+        # seg_len = np.linalg.norm(diffs, axis=-1) 
+        # move_length = np.sum(seg_len)
+        # net_disps = np.linalg.norm(C[-1] - C[0])
+        # print(f'scene:{batch["scene"][0]}, move_length: {move_length:.2f}, net_disp: {net_disps:.2f}')
+        # self.test_length_dict[batch["scene"][0]] = (move_length, net_disps)
+        # return
+
+
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
 
@@ -490,7 +506,7 @@ class ModelWrapper(LightningModule):
         # print('num_of_ctx_views', batch['context']['image'].shape[1])
         # print('num_of_tgt_views', batch['target']['image'].shape[1])
         
-        # if batch['scene'][0] != '094fd37f09dc318c':
+        # if batch['scene'][0] != 'ce6c6d81af6b62cd':
         #     return
         # print(batch['scene'])
         # save input views for visualization
@@ -525,7 +541,8 @@ class ModelWrapper(LightningModule):
                 if "depth" in batch["context"]:
                     depth_gt = batch["context"]["depth"]
                 gaussians = gaussians["gaussians"]
-
+                print(f'number of gaussians {gaussians.means.shape[1]}')
+                self.nog.append(gaussians.means.shape[1])
         # trim large scales for gscube
         # if self.gs_cube:
         #     scales = visualization_dump["cube_scales"]
@@ -712,6 +729,7 @@ class ModelWrapper(LightningModule):
                 if f"lpips" not in self.test_step_outputs:
                     self.test_step_outputs[f"lpips"] = []
 
+                # self.test_step_output_dict[scene]=compute_psnr(rgb_gt, rgb).detach().cpu().numpy()
                 self.test_step_outputs[f"psnr"].append(
                     compute_psnr(rgb_gt, rgb).mean().item()
                 )
@@ -723,11 +741,17 @@ class ModelWrapper(LightningModule):
                 )
 
     def on_test_end(self) -> None:
+        nog = np.array(self.nog).mean()
+        print(f'average number of gaussians: {nog}')
+        # np.save(Path('notes') / "test_length_dict.npy", self.test_length_dict)
+        # return
         out_dir = Path(self.test_cfg.output_path)
         saved_scores = {}
         if self.test_cfg.compute_scores:
             self.benchmarker.dump_memory(out_dir / "peak_memory.json")
             self.benchmarker.dump(out_dir / "benchmark.json")
+
+            # np.save(out_dir / "test_step_psnr_dict.npy",self.test_step_output_dict)
 
             for metric_name, metric_scores in self.test_step_outputs.items():
                 avg_scores = sum(metric_scores) / len(metric_scores)

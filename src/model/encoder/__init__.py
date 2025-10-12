@@ -17,10 +17,11 @@ EncoderCfg = EncoderDepthSplatCfg | EncoderVoxelSplatCfg
 def get_encoder(cfg: EncoderCfg, 
                 gs_cube: bool, 
                 vggt_meta:bool,
-                knn_down:bool=False
+                knn_down:bool=False,
+                gaussian_merge:bool=False
                 ) -> tuple[Encoder, Optional[EncoderVisualizer]]:
     encoder, visualizer = ENCODERS[cfg.name]
-    encoder = encoder(cfg, gs_cube, vggt_meta, knn_down)
+    encoder = encoder(cfg, gs_cube, vggt_meta, knn_down, gaussian_merge)
     if visualizer is not None:
         visualizer = visualizer(cfg.visualizer, encoder)
     return encoder, visualizer
