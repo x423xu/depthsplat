@@ -541,7 +541,7 @@ class ModelWrapper(LightningModule):
                 if "depth" in batch["context"]:
                     depth_gt = batch["context"]["depth"]
                 gaussians = gaussians["gaussians"]
-                print(f'number of gaussians {gaussians.means.shape[1]}')
+                # print(f'number of gaussians {gaussians.means.shape[1]}')
                 self.nog.append(gaussians.means.shape[1])
         # trim large scales for gscube
         # if self.gs_cube:
@@ -726,8 +726,8 @@ class ModelWrapper(LightningModule):
                     self.test_step_outputs[f"psnr"] = []
                 if f"ssim" not in self.test_step_outputs:
                     self.test_step_outputs[f"ssim"] = []
-                if f"lpips" not in self.test_step_outputs:
-                    self.test_step_outputs[f"lpips"] = []
+                # if f"lpips" not in self.test_step_outputs:
+                #     self.test_step_outputs[f"lpips"] = []
 
                 # self.test_step_output_dict[scene]=compute_psnr(rgb_gt, rgb).detach().cpu().numpy()
                 self.test_step_outputs[f"psnr"].append(
@@ -736,9 +736,9 @@ class ModelWrapper(LightningModule):
                 self.test_step_outputs[f"ssim"].append(
                     compute_ssim(rgb_gt, rgb).mean().item()
                 )
-                self.test_step_outputs[f"lpips"].append(
-                    compute_lpips(rgb_gt, rgb).mean().item()
-                )
+                # self.test_step_outputs[f"lpips"].append(
+                #     compute_lpips(rgb_gt, rgb).mean().item()
+                # )
 
     def on_test_end(self) -> None:
         nog = np.array(self.nog).mean()
