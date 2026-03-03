@@ -389,3 +389,28 @@ optimizer.lr_gs_cube=1e-5 \
 optimizer.lr=1e-5 \
 optimizer.lr_monodepth=1e-5 \
 checkpointing.no_strict_load=true
+
+
+CUDA_VISIBLE_DEVICES=6,8 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m src.main +experiment=re10k \
+dataset.roots=[/data0/xxy/data/re10k] \
+data_loader.train.batch_size=2 \
+dataset.test_chunk_interval=100 \
+trainer.max_steps=300000 \
+model.encoder.upsample_factor=4 \
+model.encoder.lowest_feature_resolution=4 \
+model.encoder.gaussians_per_cell=1 \
+model.encoder.cell_scale=4.0 \
+model.encoder.down_strides=[3,2] \
+model.encoder.cube_encoder_type=small_v3 \
+model.encoder.cube_merge_type=mean \
+model.encoder.unet_type=point_unet \
+checkpointing.pretrained_model=/data0/xxy/code/depthsplat/checkpoints/re10k-256x256-depthsplat-small/checkpoints/epoch_27-step_300000.ckpt \
+checkpointing.pretrained_mvdepth=pretrained/gmflow-scale1-things-e9887eda.pth \
+output_dir=checkpoints/gscube-depth22-gpc1-scale4-with-skip-small-v3-point-unet \
+train_controller.gs_cube=true \
+train_controller.base_model=true \
+trainer.val_check_interval=0.05 \
+optimizer.lr_gs_cube=1e-5 \
+optimizer.lr=1e-5 \
+optimizer.lr_monodepth=1e-5 \
+checkpointing.no_strict_load=true

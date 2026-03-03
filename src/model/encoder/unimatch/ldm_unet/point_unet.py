@@ -247,7 +247,7 @@ class PointUNet(nn.Module):
         out_channels: int,
         num_res_blocks: int,
         attention_resolutions: Union[Set[int], List[int], Tuple[int, ...]],
-        dropout: float = 0,
+        dropout: float = 0.0,
         channel_mult: Sequence[int] = (1, 2, 4, 8),
         conv_resample: bool = True,        # ignored (no spatial conv)
         dims: int = 2,                     # ignored (point-wise)
