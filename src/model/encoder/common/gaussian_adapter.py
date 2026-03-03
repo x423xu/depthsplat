@@ -103,7 +103,7 @@ class GaussianAdapter(nn.Module):
         else:        
             origins, directions = get_world_rays(coordinates, extrinsics, intrinsics)
             means = origins + directions * depths[..., None]
-        
+        torch.save(rearrange(means, "b v r m n l -> (b v) r (m n l)"), 'visualize/sp_coordinats.pth')
         if DEBUG:
             '''
             check if world rays are correct

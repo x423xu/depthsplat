@@ -51,6 +51,7 @@ class EncoderVoxelSplatCfg:
     lowest_feature_resolution: int
     depth_unet_channels: int
     grid_sample_disable_cudnn: bool
+    unet_type: str  # "unet" or "point_unet"
 
     # depthsplat color branch
     large_gaussian_head: bool
@@ -93,6 +94,7 @@ class EncoderVoxelSplat(Encoder[EncoderVoxelSplatCfg]):
             vit_type=cfg.monodepth_vit_type,
             unet_channels=cfg.depth_unet_channels,
             grid_sample_disable_cudnn=cfg.grid_sample_disable_cudnn,
+            unet_type=cfg.unet_type,
         )
 
         if self.cfg.train_depth_only:

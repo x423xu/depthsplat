@@ -4,11 +4,11 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-DATASET_PATH = Path("your_dataset_path")
+DATASET_PATH = Path("/data2/xxy/data/DL3DV-10K-train-8/")
 
 if __name__ == "__main__":
     # "train" or "test"
-    for stage in ["test"]:
+    for stage in ["train"]:
         stage = DATASET_PATH / stage
 
         index = {}

@@ -1,0 +1,9 @@
+# CUDA_VISIBLE_DEVICES=1 python -m notes.online_test --cell_scale 4.0 --index_path /data2/xxy/code/depthsplat/assets/evaluation_index_re10k.json
+# CUDA_VISIBLE_DEVICES=1 python -m notes.online_test --cell_scale 3.5 --index_path /data2/xxy/code/depthsplat/assets/evaluation_index_re10k.json
+# CUDA_VISIBLE_DEVICES=1 python -m notes.online_test --cell_scale 3.0 --index_path /data2/xxy/code/depthsplat/assets/evaluation_index_re10k.json
+# CUDA_VISIBLE_DEVICES=1 python -m notes.online_test --cell_scale 2.5 --index_path /data2/xxy/code/depthsplat/assets/evaluation_index_re10k.json
+# CUDA_VISIBLE_DEVICES=1 python -m notes.online_test --cell_scale 2.0 --index_path /data2/xxy/code/depthsplat/assets/evaluation_index_re10k.json
+# CUDA_VISIBLE_DEVICES=1 python -m notes.online_test --cell_scale 1.5 --index_path /data2/xxy/code/depthsplat/assets/evaluation_index_re10k.json
+# CUDA_VISIBLE_DEVICES=1 python -m notes.online_test --cell_scale 1.0 --index_path /data2/xxy/code/depthsplat/assets/evaluation_index_re10k.json
+# CUDA_VISIBLE_DEVICES=1 python -m notes.online_test --cell_scale 0.5 --index_path /data2/xxy/code/depthsplat/assets/evaluation_index_re10k.json
+CUDA_VISIBLE_DEVICES=1 python -m notes.online_test --cell_scale 0.3 --index_path /data2/xxy/code/depthsplat/assets/evaluation_index_re10k.json

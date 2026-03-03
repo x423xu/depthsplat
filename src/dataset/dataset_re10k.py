@@ -275,6 +275,7 @@ class DatasetRE10k(IterableDataset):
                 # b = np.median(d)
                 scene = example["key"]
 
+
                 if self.vggt_meta:
                     example_vggt = chunk_vggt[run_idx // times_per_scene]
                     extrinsics_vggt = example_vggt["extrinsic"]
@@ -396,6 +397,7 @@ class DatasetRE10k(IterableDataset):
                             "index": target_indices,
                         },
                         "scene": scene,
+                        
                     }
 
                 if DEBUG:
@@ -514,8 +516,8 @@ class DatasetRE10k(IterableDataset):
     @property
     def data_stage(self) -> Stage:
         if self.cfg.overfit_to_scene is not None:
-            # return "test"
-            return "train"
+            return "test"
+            # return "train"
         if self.stage == "val":
             return "test"
         return self.stage

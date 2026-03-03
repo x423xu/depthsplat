@@ -66,6 +66,7 @@ class DatasetDL3DV(IterableDataset):
         cfg: DatasetDL3DVCfg,
         stage: Stage,
         view_sampler: ViewSampler,
+        vggt_meta: bool =False
     ) -> None:
         super().__init__()
         
@@ -146,9 +147,8 @@ class DatasetDL3DV(IterableDataset):
                 example = chunk[run_idx // times_per_scene]
 
                 extrinsics, intrinsics = self.convert_poses(example["cameras"])
-
+                all_ind = extrinsics.shape[0]
                 scene = example["key"]
-
                 try:
                     extra_kwargs = {}
                     if self.cfg.overfit_to_scene is not None and self.stage != "test":
@@ -301,6 +301,7 @@ class DatasetDL3DV(IterableDataset):
                             "index": target_indices,
                         },
                         "scene": scene,
+                        "all_ind": all_ind,
                     }
 
                     if self.stage == "train" and self.cfg.augment:
@@ -385,6 +386,9 @@ class DatasetDL3DV(IterableDataset):
         return merged_index
 
     def __len__(self) -> int:
+        if self.cfg.overfit_to_scene is not None:
+            if self.stage == "test":
+                return 1
         if self.stage in ['train', 'test']:
             return (
                 min(

@@ -159,8 +159,8 @@ def legal_check_for_all_scenes(root_dir, target_shape):
     valid_folders = []
     sub_folders = sorted(glob(os.path.join(root_dir, "*/*")))
     for sub_folder in tqdm(sub_folders, desc="checking scenes..."):
-        # img_dir = os.path.join(sub_folder, 'images_8')
-        img_dir = os.path.join(sub_folder, "images_4")
+        img_dir = os.path.join(sub_folder, 'images_8')
+        # img_dir = os.path.join(sub_folder, "images_4")
         if not is_image_shape_matched(Path(img_dir), target_shape):
             print(f"image shape does not match for {sub_folder}")
             continue
@@ -187,7 +187,7 @@ if __name__ == "__main__":
     print("valid scenes:", len(valid_scenes))
 
     # test scenes
-    test_scenes = "your_test_set_index.json"
+    test_scenes = "/data2/xxy/data/DL3DV-10K-Benchmark-8/test/index.json"
     with open(test_scenes, "r") as f:
         overlap_scenes = json.load(f)
 

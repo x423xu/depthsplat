@@ -51,7 +51,6 @@ def cyan(text: str) -> str:
 )
 def train(cfg_dict: DictConfig):
 
-
     if cfg_dict["mode"] == "train" and cfg_dict["train"]["eval_model_every_n_val"] > 0:
         eval_cfg_dict = copy.deepcopy(cfg_dict)
         dataset_dir = str(cfg_dict["dataset"]["roots"]).lower()
@@ -59,7 +58,12 @@ def train(cfg_dict: DictConfig):
             eval_path = "assets/evaluation_index_re10k.json"
         elif "dl3dv" in dataset_dir:
             if cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 6:
-                eval_path = "assets/dl3dv_start_0_distance_50_ctx_6v_tgt_8v.json"
+                eval_path = "assets/dl3dv_start_0_distance_50_ctx_6v_video_0_50.json"
+            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 4:
+                eval_path = "/data2/xxy/code/depthsplat/assets/dl3dv_start_0_distance_50_ctx_4v_video_0_50.json"
+            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 2:
+                # eval_path = "assets/dl3dv_start_0_distance_10_ctx_2v_tgt_4v.json"
+                eval_path = "assets/dl3dv_start_0_distance_50_ctx_2v_video_0_50.json"
             else:
                 raise ValueError("unsupported number of views for dl3dv")
         else:
@@ -75,6 +79,8 @@ def train(cfg_dict: DictConfig):
 
     cfg = load_typed_root_config(cfg_dict)
     set_cfg(cfg_dict)
+
+    print(cfg_dict.model.encoder.monodepth_vit_type)
 
     # Set up the output directory.
     if cfg_dict.output_dir is None:
@@ -197,7 +203,7 @@ def train(cfg_dict: DictConfig):
     if cfg.mode == "train":
         # only load monodepth
         if cfg.checkpointing.pretrained_monodepth is not None:
-            strict_load = False
+            strict_load = True
             pretrained_model = torch.load(cfg.checkpointing.pretrained_monodepth, map_location='cpu')
             if 'state_dict' in pretrained_model:
                 pretrained_model = pretrained_model['state_dict']
@@ -224,8 +230,19 @@ def train(cfg_dict: DictConfig):
             pretrained_model = torch.load(cfg.checkpointing.pretrained_model, map_location='cpu')
             if 'state_dict' in pretrained_model:
                 pretrained_model = pretrained_model['state_dict']
-
-            model_wrapper.load_state_dict(pretrained_model, strict=strict_load)
+            # support shape mismatch when loading pretrained model
+            model_state_dict = model_wrapper.state_dict()
+            filtered_state_dict = {}
+            for k, v in pretrained_model.items():
+                if k in model_state_dict:
+                    if v.shape == model_state_dict[k].shape:
+                        filtered_state_dict[k] = v
+                    else:
+                        print(f"Skipping {k} due to shape mismatch: {v.shape} vs {model_state_dict[k].shape}")
+                else:
+                    print(f"Skipping {k} (not in model)")
+            pretrained_model = filtered_state_dict
+            model_wrapper.load_state_dict(pretrained_model, strict=not cfg.checkpointing.no_strict_load)
             print(
                 cyan(
                     f"Loaded pretrained weights: {cfg.checkpointing.pretrained_model}"

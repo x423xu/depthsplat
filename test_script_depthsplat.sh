@@ -1,0 +1,7 @@
+CUDA_VISIBLE_DEVICES=3 python -m notes.online_test --model depthsplat --index_path /data2/xxy/code/depthsplat/assets/evaluation_index_re10k_all_2v_0.8ind.json --out_dir notes/depthsplat_2v --model_path /data0/xxy/code/depthsplat/checkpoints/re10k-256x256-depthsplat-small/checkpoints/epoch_27-step_300000.ckpt
+CUDA_VISIBLE_DEVICES=3 python -m notes.online_test --model depthsplat --index_path /data2/xxy/code/depthsplat/assets/evaluation_index_re10k_all_4v_0.8ind.json --out_dir notes/depthsplat_4v --model_path /data0/xxy/code/depthsplat/checkpoints/re10k-256x256-depthsplat-small/checkpoints/epoch_27-step_300000.ckpt
+CUDA_VISIBLE_DEVICES=3 python -m notes.online_test --model depthsplat --index_path /data2/xxy/code/depthsplat/assets/evaluation_index_re10k_all_6v_0.8ind.json --out_dir notes/depthsplat_6v --model_path /data0/xxy/code/depthsplat/checkpoints/re10k-256x256-depthsplat-small/checkpoints/epoch_27-step_300000.ckpt
+CUDA_VISIBLE_DEVICES=3 python -m notes.online_test --model depthsplat --index_path /data2/xxy/code/depthsplat/assets/evaluation_index_re10k_all_8v_0.8ind.json --out_dir notes/depthsplat_8v --model_path /data0/xxy/code/depthsplat/checkpoints/re10k-256x256-depthsplat-small/checkpoints/epoch_27-step_300000.ckpt
+
+# bounded
+CUDA_VISIBLE_DEVICES=3 python -m notes.online_test --model depthsplat --index_path /data2/xxy/code/depthsplat/assets/evaluation_index_re10k.json --out_dir notes/depthsplat_2v_bounded --model_path /data0/xxy/code/depthsplat/checkpoints/re10k-256x256-depthsplat-small/checkpoints/epoch_27-step_300000.ckpt

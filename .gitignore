@@ -181,3 +181,6 @@ train_model*
 *.pth
 *.pt
 *.ckpt
+visualize/
+supplementary/
+*.json

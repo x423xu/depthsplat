@@ -3,17 +3,19 @@ from torch.utils.data import Dataset
 from ..misc.step_tracker import StepTracker
 from .dataset_re10k import DatasetRE10k, DatasetRE10kCfg
 from .dataset_dl3dv import DatasetDL3DV, DatasetDL3DVCfg
+from .dataset_scannet import DatasetScannet, DatasetScannetCfg
 from .types import Stage
 from .view_sampler import get_view_sampler
 
 DATASETS: dict[str, Dataset] = {
     "re10k": DatasetRE10k,
     "dl3dv": DatasetDL3DV,
+    "scannet": DatasetScannet,
 }
 
 
-# DatasetCfg = DatasetRE10kCfg | DatasetDL3DVCfg
-DatasetCfg = DatasetRE10kCfg
+DatasetCfg = DatasetRE10kCfg | DatasetDL3DVCfg | DatasetScannetCfg
+# DatasetCfg = DatasetRE10kCfg
 
 
 def get_dataset(

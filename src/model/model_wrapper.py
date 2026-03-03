@@ -51,9 +51,11 @@ from src.visualization.vis_depth import viz_depth_tensor
 from PIL import Image
 from ..misc.stablize_camera import render_stabilization_path
 from .ply_export import save_gaussian_ply, save_gaussian_cube_ply
+from .types import Gaussians
 
 
 DEBUG = False
+NOISE=True
 
 @dataclass
 class OptimizerCfg:
@@ -138,9 +140,23 @@ class ModelWrapper(LightningModule):
         step_tracker: StepTracker | None,
         eval_data_cfg: Optional[DatasetCfg | None] = None,
         train_controller_cfg=None,
+        iter_depth: bool = False,
+        view_base: int = 2,
+        batch_forward: bool = False,
+        anchor_features: bool = False,
+        chunk_num: int = 1,
+        anchor_base: int = 4,
+        noise_ratio: float = 0.0,
     ) -> None:
         super().__init__()
         # self.automatic_optimization = False
+        self.iter_depth = iter_depth
+        self.view_base = view_base
+        self.batch_forward = batch_forward
+        self.chunk_num = chunk_num
+        self.anchor_features = anchor_features
+        self.anchor_base = anchor_base
+        self.noise_ratio = noise_ratio
 
         self.optimizer_cfg = optimizer_cfg
         self.test_cfg = test_cfg
@@ -176,8 +192,8 @@ class ModelWrapper(LightningModule):
             self.test_step_outputs = {}
             self.time_skip_steps_dict = {"encoder": 0, "decoder": 0}
             self.nog = []
-            # self.test_step_output_dict = {}
-            # self.test_length_dict = {}
+            self.test_step_output_dict = {}
+            self.all_ind = {}
 
 
     def _handle_oom(self, where: str):
@@ -268,8 +284,7 @@ class ModelWrapper(LightningModule):
 
         gaussians = self.encoder(
             batch["context"], self.global_step, False, scene_names=batch["scene"], random_scale=self.train_controller_cfg.random_scale
-        )
-    
+        )       
 
         if isinstance(gaussians, dict):
             if self.gs_cube:
@@ -482,10 +497,82 @@ class ModelWrapper(LightningModule):
             os.system("nvidia-smi")
         return total_loss
     
+    def _chunk(self, context):
+        chunk_num = self.chunk_num
+        b, v, _, h, w = context["image"].shape
+        if chunk_num == 1:
+            return [context]
+        assert v % chunk_num == 0
+        chunk_size = v // chunk_num
+        contexts = []
+        for i in range(chunk_num):
+            context_tmp={}
+            for k in context.keys():
+                context_tmp[k] = context[k][:, i*chunk_size:(i+1)*chunk_size]
+            contexts.append(context_tmp)
+        return contexts
+
+    def _batch_forward(self, context, visualization_dump=None):
+        def _merge(gaussians_list):
+            new_gaussians = {}
+            for gaussians in gaussians_list:
+                for k in gaussians.keys():
+                    if k not in new_gaussians:
+                        new_gaussians[k] = []
+                    new_gaussians[k].append(gaussians[k])
+            for k in new_gaussians.keys():
+                if k == 'gaussians':
+                    length = len(new_gaussians['gaussians'])
+                    means = [new_gaussians['gaussians'][l_].means for l_ in range(length)]
+                    covarainces = [new_gaussians['gaussians'][l_].covariances for l_ in range(length)]
+                    harmonics = [new_gaussians['gaussians'][l_].harmonics for l_ in range(length)]
+                    opacities = [new_gaussians['gaussians'][l_].opacities for l_ in range(length)]
+                    means = torch.cat(means, dim=1)
+                    covarainces = torch.cat(covarainces, dim=1)
+                    harmonics = torch.cat(harmonics, dim=1)
+                    opacities = torch.cat(opacities, dim=1)
+                    new_gaussians['gaussians'] = Gaussians(means, covarainces, harmonics, opacities)
+                elif k == 'depths':
+                    new_gaussians[k] = torch.cat(new_gaussians[k], dim=1)
+                else:
+                    pass   
+            return new_gaussians
+        if self.batch_forward and self.chunk_num>1:
+            contexts = self._chunk(context)
+            gaussians_batch = []
+            for c in contexts:
+                gaussians = self._online_test_forward(c, visualization_dump=visualization_dump)
+                gaussians_batch.append(gaussians)
+            gaussians = _merge(gaussians_batch)
+        else:
+            gaussians = self._online_test_forward(context, visualization_dump=visualization_dump)
+        return gaussians
+
+    def _online_test_forward(self, context, visualization_dump=None):
+        v = context["image"].shape[1]
+        if self.iter_depth:
+            gaussians = self._anchor_forward(context, visualization_dump=visualization_dump, view_base=self.view_base)
+        else:
+            gaussians = self._anchor_forward(context, visualization_dump=visualization_dump, view_base = v)
+        return gaussians
+    
+    def _anchor_forward(self,  context, visualization_dump=None, view_base=2):
+        gaussians = self.encoder.anchor_forward(
+            context,
+            self.global_step,
+            deterministic=False,
+            visualization_dump=visualization_dump,
+            view_base=view_base,
+            anchor_features=self.anchor_features,
+            anchor_base=self.anchor_base,
+            noise_ratio=self.noise_ratio,
+        )
+        return gaussians
     def test_step(self, batch, batch_idx):
+        # print(f'batch_idx: {batch_idx}', batch['scene'][0])
+        # return
         # torch.cuda.empty_cache()
         batch: BatchedExample = self.data_shim(batch)
-
         # # get move length
         # P = batch["context"]['extrinsics'][0].cpu().numpy() # V,4,4
         # C = P[:,:3,3]
@@ -496,7 +583,6 @@ class ModelWrapper(LightningModule):
         # print(f'scene:{batch["scene"][0]}, move_length: {move_length:.2f}, net_disp: {net_disps:.2f}')
         # self.test_length_dict[batch["scene"][0]] = (move_length, net_disps)
         # return
-
 
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
@@ -529,17 +615,21 @@ class ModelWrapper(LightningModule):
         # Render Gaussians.
         with self.benchmarker.time("encoder"):
             # batch["context"]["extrinsics"] = batch["context"]["extrinsics"] + 0.01*torch.rand_like(batch["context"]["extrinsics"])
-            gaussians = self.encoder(
-                batch["context"],
-                self.global_step,
-                deterministic=False,
-                visualization_dump=visualization_dump,
-            )
+            gaussians = self._batch_forward(batch['context'], visualization_dump=visualization_dump)
+            # check depth
+            # depths_my = gaussians["depths"]  # [1, V, H, W]
+            # for nd, depth_i in enumerate(depths_my[0]):
+            #     depth_i = depth_i.cpu()
+            #     depth_viz = viz_depth_tensor(
+            #             1.0 / depth_i, return_numpy=True
+            #         )
+            #     Image.fromarray(depth_viz).save(f'notes/depths/depth_check_{nd}.png')
+
 
             if isinstance(gaussians, dict):
                 pred_depths = gaussians["depths"]
                 if "depth" in batch["context"]:
-                    depth_gt = batch["context"]["depth"]
+                    depth_gt = batch["context"]["depth"]         
                 gaussians = gaussians["gaussians"]
                 # print(f'number of gaussians {gaussians.means.shape[1]}')
                 self.nog.append(gaussians.means.shape[1])
@@ -610,7 +700,7 @@ class ModelWrapper(LightningModule):
                             render_near[:, start:end],
                             render_far[:, start:end],
                             (h, w),
-                            depth_mode=None,
+                            depth_mode="depth",
                             vggt_meta=self.vggt_meta
                         )
 
@@ -621,6 +711,10 @@ class ModelWrapper(LightningModule):
                             output.color = torch.cat(
                                 (output.color, curr_output.color), dim=1
                             )
+                            if hasattr(output, "depth") and hasattr(curr_output, "depth"):
+                                output.depth = torch.cat(
+                                    (output.depth, curr_output.depth), dim=1
+                                )
 
                 else:
                     output = self.decoder.forward(
@@ -640,6 +734,18 @@ class ModelWrapper(LightningModule):
 
         # save depth
         if self.test_cfg.save_depth:
+            out_depth = output.depth[0]  # [V, H, W]
+            for idx, depth_i in zip(batch["target"]["index"][0], out_depth):
+                depth_i = depth_i.cpu().detach()
+                depth_i = (depth_i - depth_i.min()) / (depth_i.max() - depth_i.min() + 1e-8)
+                depth_viz = viz_depth_tensor(
+                    depth_i, return_numpy=True
+                )  # [H, W, 3]
+                save_path = path / "images" / scene / "depth" / f"out_depth_{idx:0>6}.png"
+                save_dir = os.path.dirname(save_path)
+                os.makedirs(save_dir, exist_ok=True)
+                Image.fromarray(depth_viz).save(save_path)
+
             if self.train_cfg.forward_depth_only:
                 depth = pred_depths[0].cpu().detach()  # [V, H, W]
             else:
@@ -726,24 +832,24 @@ class ModelWrapper(LightningModule):
                     self.test_step_outputs[f"psnr"] = []
                 if f"ssim" not in self.test_step_outputs:
                     self.test_step_outputs[f"ssim"] = []
-                # if f"lpips" not in self.test_step_outputs:
-                #     self.test_step_outputs[f"lpips"] = []
+                if f"lpips" not in self.test_step_outputs:
+                    self.test_step_outputs[f"lpips"] = []
 
-                # self.test_step_output_dict[scene]=compute_psnr(rgb_gt, rgb).detach().cpu().numpy()
+                self.test_step_output_dict[scene]=compute_psnr(rgb_gt, rgb).detach().cpu().numpy()
                 self.test_step_outputs[f"psnr"].append(
                     compute_psnr(rgb_gt, rgb).mean().item()
                 )
                 self.test_step_outputs[f"ssim"].append(
                     compute_ssim(rgb_gt, rgb).mean().item()
                 )
-                # self.test_step_outputs[f"lpips"].append(
-                #     compute_lpips(rgb_gt, rgb).mean().item()
-                # )
+                self.test_step_outputs[f"lpips"].append(
+                    compute_lpips(rgb_gt, rgb).mean().item()
+                )
 
     def on_test_end(self) -> None:
         nog = np.array(self.nog).mean()
         print(f'average number of gaussians: {nog}')
-        # np.save(Path('notes') / "test_length_dict.npy", self.test_length_dict)
+        # np.save(Path('notes') / "scannet_ind.npy", self.all_ind)
         # return
         out_dir = Path(self.test_cfg.output_path)
         saved_scores = {}
@@ -751,7 +857,7 @@ class ModelWrapper(LightningModule):
             self.benchmarker.dump_memory(out_dir / "peak_memory.json")
             self.benchmarker.dump(out_dir / "benchmark.json")
 
-            # np.save(out_dir / "test_step_psnr_dict.npy",self.test_step_output_dict)
+            np.save(out_dir / "test_step_psnr_dict.npy",self.test_step_output_dict)
 
             for metric_name, metric_scores in self.test_step_outputs.items():
                 avg_scores = sum(metric_scores) / len(metric_scores)
@@ -1004,6 +1110,7 @@ class ModelWrapper(LightningModule):
                 save_path = Path(get_cfg()['output_dir']) / 'gaussians_cube' / (scene + f'_{self.global_step}' + '.ply')
                 save_gaussian_cube_ply(gaussians_softmax, visualization_dump, batch, save_path)
                 visualization_dump = None
+        torch.cuda.empty_cache()
 
     def on_validation_epoch_end(self) -> None:
         # with torch.autocast(device_type=self.device.type, enabled=False):

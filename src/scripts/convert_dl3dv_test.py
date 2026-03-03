@@ -29,7 +29,7 @@ parser.add_argument(
         "images_8",
     ],
 )
-parser.add_argument("--n_test", type=int, default=10, help="test skip")
+parser.add_argument("--n_test", type=int, default=1, help="test skip")
 parser.add_argument("--which_stage", type=str, default=None, help="dataset directory")
 parser.add_argument("--detect_overlap", action="store_true")
 
@@ -158,8 +158,8 @@ def legal_check_for_all_scenes(root_dir, target_shape):
     valid_folders = []
     sub_folders = sorted(glob(os.path.join(root_dir, "*/nerfstudio")))
     for sub_folder in tqdm(sub_folders, desc="checking scenes..."):
-        img_dir = os.path.join(sub_folder, "images_8")  # 270x480
-        # img_dir = os.path.join(sub_folder, 'images_4')  # 540x960
+        # img_dir = os.path.join(sub_folder, "images_8")  # 270x480
+        img_dir = os.path.join(sub_folder, 'images_4')  # 540x960
         if not is_image_shape_matched(Path(img_dir), target_shape):
             print(f"image shape does not match for {sub_folder}")
             continue

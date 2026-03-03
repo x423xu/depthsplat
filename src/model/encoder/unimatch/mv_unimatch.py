@@ -12,6 +12,7 @@ from .matching import warp_with_pose_depth_candidates
 from .utils import mv_feature_add_position
 from .dpt_head import DPTHead
 from .ldm_unet.unet import UNetModel, AttentionBlock
+from .ldm_unet.point_unet import PointUNet
 from einops import rearrange
 
 
@@ -32,6 +33,7 @@ class MultiViewUniMatch(nn.Module):
         unet_num_res_blocks=1,
         unet_attn_resolutions=[4],
         grid_sample_disable_cudnn=False,
+        unet_type="unet",
         **kwargs,
     ):
         super(MultiViewUniMatch, self).__init__()
@@ -41,6 +43,13 @@ class MultiViewUniMatch(nn.Module):
         self.num_scales = num_scales
         self.lowest_feature_resolution = lowest_feature_resolution
         self.upsample_factor = upsample_factor
+
+        # UNet type selection
+        self.unet_type = unet_type
+        assert unet_type in ("unet", "point_unet"), (
+            f"Unknown unet_type={unet_type!r}. Choose 'unet' or 'point_unet'."
+        )
+        _UNetClass = PointUNet if unet_type == "point_unet" else UNetModel
 
         # monocular backbones: final
         self.vit_type = vit_type
@@ -127,7 +136,7 @@ class MultiViewUniMatch(nn.Module):
             ]
 
             modules.append(
-                UNetModel(
+                _UNetClass(
                     image_size=None,
                     in_channels=channels,
                     model_channels=channels,

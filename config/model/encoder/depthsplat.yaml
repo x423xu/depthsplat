@@ -43,6 +43,7 @@ upsample_factor: 4
 lowest_feature_resolution: 4
 depth_unet_channels: 128
 grid_sample_disable_cudnn: false
+unet_type: unet  # "unet" or "point_unet"
 
 # depthsplat color branch
 large_gaussian_head: false
@@ -58,6 +59,7 @@ gs_cube: false
 
 gaussians_per_cell: 4
 down_strides: [2, 2]
-cell_scale: 1
+cell_scale: 1.0
 cube_encoder_type: large
 cube_merge_type: max
+stem_norm: bn
