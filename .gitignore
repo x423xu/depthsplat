@@ -183,4 +183,4 @@ train_model*
 *.ckpt
 visualize/
 supplementary/
-*.json
+assets/
