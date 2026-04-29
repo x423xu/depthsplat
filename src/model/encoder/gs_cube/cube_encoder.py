@@ -527,7 +527,7 @@ class GSCubeEncoder(Swin3DUNet):
             feats_rest = rearrange(feats_rest, "b v (h w) l -> b (v h w) l", b=b, v=v-nv, h=h, w=w)
             conf_rest = rearrange(conf_rest, "b v (h w) l -> b (v h w) l", b=b, v=v-nv, h=h, w=w)
 
-            conf_rest_selected_ind = torch.where(conf_rest[0,:,0]>0.95)[0]
+            conf_rest_selected_ind = torch.where(conf_rest[0,:,0]>0.999)[0]
             xyz_world_rest = xyz_world_rest[:,conf_rest_selected_ind,:]
             imgs_rest = imgs_rest[:,conf_rest_selected_ind,:]
             feats_rest = feats_rest[:,conf_rest_selected_ind,:]
@@ -713,7 +713,7 @@ class GSCubeEncoder(Swin3DUNet):
                 batch_coords_centers.append(coords_centers)
                 batch_positions.append(positions)    
                 batch_feats.append(feats_unique)
-            print(f'shape before removing overlaps: {shape_before_remove}, shape after removing overlaps: {shape_after_remove}')
+            # print(f'shape before removing overlaps: {shape_before_remove}, shape after removing overlaps: {shape_after_remove}')
             # stack the coords
             batch_coords_centers = torch.cat(batch_coords_centers, dim=0)  # [N,4]
             batch_positions = torch.cat(batch_positions, dim=0)  # [N, 4]     

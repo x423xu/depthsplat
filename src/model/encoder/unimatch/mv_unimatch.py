@@ -15,7 +15,31 @@ from .ldm_unet.unet import UNetModel, AttentionBlock
 from .ldm_unet.point_unet import PointUNet
 from einops import rearrange
 
+TIMER=False
 
+if TIMER:
+    import time
+    class TIME:
+        def __init__(self, name):
+            self.name = name
+            self.start_time = time.time()
+        
+        def tick(self):
+            if getattr(self, "elapsed_time", None) is None:
+                elapsed_time = time.time() - self.start_time
+                print(f"{self.name}: {elapsed_time:.4f} seconds")
+                self.elapsed_time = elapsed_time
+
+    def time_statistics(timers):
+        percents = []
+        total_time = 0
+        total_time = sum(timer.elapsed_time for timer in timers)
+        for timer in timers:
+            percents.append((timer.name, timer.elapsed_time, timer.elapsed_time / total_time * 100))
+        print("Time statistics:")
+        for name, elapsed_time, percent in percents:
+            print(f"{name}: {elapsed_time:.4f} seconds, {percent:.2f}%")
+        
 class MultiViewUniMatch(nn.Module):
     def __init__(
         self,
@@ -129,11 +153,18 @@ class MultiViewUniMatch(nn.Module):
                 unet_attn_resolutions = [x * 2 for x in unet_attn_resolutions]
 
             # unet
-            modules = [
-                nn.Conv2d(in_channels, channels, 3, 1, 1),
-                nn.GroupNorm(8, channels),
-                nn.GELU(),
-            ]
+            if unet_type == "point_unet":
+                modules = [
+                    nn.Conv2d(in_channels, channels, 1),
+                    nn.GroupNorm(8, channels),
+                    nn.GELU(),
+                ]
+            else:
+                modules = [
+                    nn.Conv2d(in_channels, channels, 3, 1, 1),
+                    nn.GroupNorm(8, channels),
+                    nn.GELU(),
+                ]
 
             modules.append(
                 _UNetClass(
@@ -152,7 +183,10 @@ class MultiViewUniMatch(nn.Module):
                 )
             )
 
-            modules.append(nn.Conv2d(channels, channels, 3, 1, 1))
+            if unet_type == "point_unet":
+                modules.append(nn.Conv2d(channels, channels, 1))
+            else:
+                modules.append(nn.Conv2d(channels, channels, 3, 1, 1))
 
             self.regressor.append(nn.Sequential(*modules))
 
@@ -258,6 +292,9 @@ class MultiViewUniMatch(nn.Module):
         if torch.isnan(images).any():
             print("Nan in images")
             raise ValueError("Nan in images")
+        # calculate time cost
+        if TIMER:
+            cnn_timer = TIME("CNN forward")
 
         # update the num_views in unet attention, useful for random input views
         set_num_views(self.regressor, num_views=v)
@@ -300,12 +337,20 @@ class MultiViewUniMatch(nn.Module):
                 rearrange(features_cnn_pos, "(b v) c h w -> b v c h w", b=b, v=v), dim=1
             )
         )
+
+        if TIMER:
+            cnn_timer.tick()
+            transformer_timer = TIME("Transformer forward")
+
         features_list_mv = self.transformer(
             features_list,
             attn_num_splits=attn_splits,
             nn_matrix=nn_matrix,
         )
 
+        if TIMER:
+            transformer_timer.tick()
+            mono_timer = TIME("Before cost volume after transformer")
         features_mv = rearrange(
             torch.stack(features_list_mv, dim=1), "b v c h w -> (b v) c h w"
         )  # [BV, C, H, W]
@@ -386,6 +431,10 @@ class MultiViewUniMatch(nn.Module):
         results_dict.update({"features_mono": features_list_mono})
 
         depth = None
+
+        if TIMER:
+            mono_timer.tick()
+            before_cost_volume_timer = TIME("Cost volume and following operations")
 
         for scale_idx in range(self.num_scales):
             downsample_factor = self.upsample_factor * (
@@ -515,6 +564,9 @@ class MultiViewUniMatch(nn.Module):
                 1, tgt_features.size(1), 1, 1
             )  # [BV, V-1, 3, 3]
 
+            if TIMER:
+                before_cost_volume_timer.tick()
+                cost_volume_timer = TIME("Cost volume")
             warped_tgt_features = warp_with_pose_depth_candidates(
                 rearrange(tgt_features, "b v ... -> (b v) ..."),
                 rearrange(intrinsics_input, "b v ... -> (b v) ..."),
@@ -523,6 +575,9 @@ class MultiViewUniMatch(nn.Module):
                 grid_sample_disable_cudnn=self.grid_sample_disable_cudnn,
             )  # [BV*(V-1), C, D, H, W]
 
+            if TIMER:
+                cost_volume_timer.tick()
+                other_timer = TIME("Other forward operations")
             # ref: [BV, C, H, W]
             # warped: [BV*(V-1), C, D, H, W] -> [BV, V-1, C, D, H, W]
             warped_tgt_features = rearrange(
@@ -612,6 +667,9 @@ class MultiViewUniMatch(nn.Module):
                 )
 
                 depth_preds.append(depth)
+                if TIMER:
+                    other_timer.tick()
+                    time_statistics([cnn_timer, transformer_timer, mono_timer, before_cost_volume_timer, cost_volume_timer, other_timer])
         '''
         We guess this part might cause Nan values in depth
         debug nan

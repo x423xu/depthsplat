@@ -512,7 +512,7 @@ class ModelWrapper(LightningModule):
             contexts.append(context_tmp)
         return contexts
 
-    def _batch_forward(self, context, visualization_dump=None):
+    def _batch_forward(self, context, visualization_dump=None, scene=None):
         def _merge(gaussians_list):
             new_gaussians = {}
             for gaussians in gaussians_list:
@@ -541,22 +541,22 @@ class ModelWrapper(LightningModule):
             contexts = self._chunk(context)
             gaussians_batch = []
             for c in contexts:
-                gaussians = self._online_test_forward(c, visualization_dump=visualization_dump)
+                gaussians = self._online_test_forward(c, visualization_dump=visualization_dump,scene=scene)
                 gaussians_batch.append(gaussians)
             gaussians = _merge(gaussians_batch)
         else:
-            gaussians = self._online_test_forward(context, visualization_dump=visualization_dump)
+            gaussians = self._online_test_forward(context, visualization_dump=visualization_dump,scene=scene)
         return gaussians
 
-    def _online_test_forward(self, context, visualization_dump=None):
+    def _online_test_forward(self, context, visualization_dump=None, scene=None):
         v = context["image"].shape[1]
         if self.iter_depth:
-            gaussians = self._anchor_forward(context, visualization_dump=visualization_dump, view_base=self.view_base)
+            gaussians = self._anchor_forward(context, visualization_dump=visualization_dump, view_base=self.view_base, scene=scene)
         else:
-            gaussians = self._anchor_forward(context, visualization_dump=visualization_dump, view_base = v)
+            gaussians = self._anchor_forward(context, visualization_dump=visualization_dump, view_base = v, scene=scene)
         return gaussians
     
-    def _anchor_forward(self,  context, visualization_dump=None, view_base=2):
+    def _anchor_forward(self,  context, visualization_dump=None, view_base=2, scene=None):
         gaussians = self.encoder.anchor_forward(
             context,
             self.global_step,
@@ -566,6 +566,7 @@ class ModelWrapper(LightningModule):
             anchor_features=self.anchor_features,
             anchor_base=self.anchor_base,
             noise_ratio=self.noise_ratio,
+            scene=scene
         )
         return gaussians
     def test_step(self, batch, batch_idx):
@@ -573,6 +574,7 @@ class ModelWrapper(LightningModule):
         # return
         # torch.cuda.empty_cache()
         batch: BatchedExample = self.data_shim(batch)
+        (scene,) = batch["scene"]
         # # get move length
         # P = batch["context"]['extrinsics'][0].cpu().numpy() # V,4,4
         # C = P[:,:3,3]
@@ -613,9 +615,18 @@ class ModelWrapper(LightningModule):
             visualization_dump = None
 
         # Render Gaussians.
+        nv = batch['context']['extrinsics'].shape[1]
+        if not os.path.exists('sem_seg/depthsplat_input_features_{}v'.format(nv)):
+            os.makedirs('sem_seg/depthsplat_input_features_{}v'.format(nv))
         with self.benchmarker.time("encoder"):
             # batch["context"]["extrinsics"] = batch["context"]["extrinsics"] + 0.01*torch.rand_like(batch["context"]["extrinsics"])
-            gaussians = self._batch_forward(batch['context'], visualization_dump=visualization_dump)
+            gaussians = self._batch_forward(batch['context'], visualization_dump=visualization_dump, scene=scene)
+            # gaussians = self.encoder(
+            #     batch["context"],
+            #     self.global_step,
+            #     deterministic=False,
+            #     visualization_dump=visualization_dump,
+            # )
             # check depth
             # depths_my = gaussians["depths"]  # [1, V, H, W]
             # for nd, depth_i in enumerate(depths_my[0]):
@@ -646,6 +657,21 @@ class ModelWrapper(LightningModule):
         #     visualization_dump["cube_rotations"] = visualization_dump["cube_rotations"][:,selected_ind]
 
         # save gaussians
+        
+        feature_splat_meta = {
+            'extrinsics': batch['target']['extrinsics'][0].detach().cpu(),
+            'intrinsics': batch['target']['intrinsics'][0].detach().cpu(),
+            "image_shape": (256,256),
+            'near': batch['target']['near'][0].detach().cpu(),
+            'far': batch['target']['far'][0].detach().cpu(),
+        }
+        torch.save(feature_splat_meta,'sem_seg/depthsplat_input_features_{}v/{}_meta.pt'.format(nv,scene))
+        save_gaussians = {
+            'means': gaussians.means[0].detach().cpu(),
+            'covariances': gaussians.covariances[0].detach().cpu(),
+            'opacities': gaussians.opacities[0].detach().cpu(),
+        }
+        torch.save(save_gaussians, 'sem_seg/depthsplat_input_features_{}v/{}_gaussians.pt'.format(nv,scene))
         if self.test_cfg.save_gaussian: 
             if self.gs_cube:
                 scene = batch["scene"][0]
@@ -834,8 +860,11 @@ class ModelWrapper(LightningModule):
                     self.test_step_outputs[f"ssim"] = []
                 if f"lpips" not in self.test_step_outputs:
                     self.test_step_outputs[f"lpips"] = []
+                if f"psnr_3" not in self.test_step_outputs:
+                    self.test_step_outputs[f"psnr_3"] = []
 
                 self.test_step_output_dict[scene]=compute_psnr(rgb_gt, rgb).detach().cpu().numpy()
+                
                 self.test_step_outputs[f"psnr"].append(
                     compute_psnr(rgb_gt, rgb).mean().item()
                 )
@@ -845,6 +874,15 @@ class ModelWrapper(LightningModule):
                 self.test_step_outputs[f"lpips"].append(
                     compute_lpips(rgb_gt, rgb).mean().item()
                 )
+                
+                n_3 = rgb_gt.shape[0]//3
+                if n_3>1:
+                    psnr_3 = []
+                    for i in range(n_3):
+                        psnr_3.append(
+                            compute_psnr(rgb_gt[i*3:(i+1)*3], rgb[i*3:(i+1)*3]).mean().item()
+                        )
+                    self.test_step_outputs[f"psnr_3"].append(psnr_3)
 
     def on_test_end(self) -> None:
         nog = np.array(self.nog).mean()
@@ -860,7 +898,13 @@ class ModelWrapper(LightningModule):
             np.save(out_dir / "test_step_psnr_dict.npy",self.test_step_output_dict)
 
             for metric_name, metric_scores in self.test_step_outputs.items():
-                avg_scores = sum(metric_scores) / len(metric_scores)
+                if metric_name == "psnr_3":
+                    avg_scores = []
+                    # avg on first dimension
+                    for scores in zip(*metric_scores):
+                        avg_scores.append(sum(scores) / len(scores))
+                else:
+                    avg_scores = sum(metric_scores) / len(metric_scores)
                 saved_scores[metric_name] = avg_scores
                 print(metric_name, avg_scores)
                 with (out_dir / f"scores_{metric_name}_all.json").open("w") as f:

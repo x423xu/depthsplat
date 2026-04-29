@@ -26,9 +26,9 @@ from .unimatch.dpt_head import DPTHead
 import MinkowskiEngine as ME
 from torch_scatter.composite import scatter_softmax
 from torch_scatter import scatter_add
-
+import time
 DEBUG = False
-
+TIMER = False
 @dataclass
 class EncoderDepthSplatCfg:
     name: Literal["depthsplat"]
@@ -418,6 +418,9 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         else:
             cameras_dist_index = None
 
+        if TIMER:
+            start_time_depth = time.time()
+            all_start = time.time()
         # depth prediction
         results_dict = self.depth_predictor(
             context["image"],
@@ -428,7 +431,10 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             extrinsics=context["extrinsics"],
             nn_matrix=cameras_dist_index,
         )
-
+        if TIMER:
+            end_time_depth = time.time()
+            print(f"Depth prediction time: {end_time_depth - start_time_depth:.4f} seconds")
+            start_time_upsampler = time.time()
         if self.vggt_meta:
             depth = context["depth"]
             depth_preds = depth[None]
@@ -511,7 +517,10 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
 
         out = torch.cat(concat, dim=1)
         depths = rearrange(depth, "b v h w -> b v (h w) () ()")
-
+        if TIMER:
+            end_time_upsampler = time.time()
+            print(f"Feature upsampling and regressor time: {end_time_upsampler - start_time_upsampler:.4f} seconds")
+            start_time_cube = time.time()
         if self.gs_cube:
             '''
             the input_cube_tensor maintains the initialized world coordinates information, e.g., coordinates, rgbs, cell_sizes, xyz_min, xyz_max
@@ -530,12 +539,24 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                                             conf = match_prob,
                                             random_scale=random_scale,
                                             return_selected_ind=return_selected_ind)
+            if TIMER:
+                end_time_cube = time.time()
+                all_time = end_time_cube - all_start
+                print(f"GS Cube encoding time: {end_time_cube - start_time_cube:.4f} seconds")
+                print(f"Total encoder time: {end_time_cube - all_start:.4f} seconds")
+                percents = []
+                percents.append(("Depth prediction", end_time_depth - start_time_depth))
+                percents.append(("Feature upsampling and regressor", end_time_upsampler - start_time_upsampler))
+                percents.append(("GS Cube encoding", end_time_cube - start_time_cube))
+                total = sum(p[1] for p in percents)
+                for name, elapsed in percents:
+                    print(f"{name}: {elapsed:.4f} seconds, {elapsed/total*100:.2f}%")
             if return_selected_ind and visualization_dump is not None:
                 visualization_dump["selected_ind"] = input_cube_tensor_perview
                 visualization_dump['cell_sizes'] = input_cube_tensor.cell_sizes
             # torch.save(gs_cube.F, 'notes/gs_cube_F_8.pth')
             # torch.save(gs_cube.C, 'notes/gs_cube_C_8.pth')
-       
+            
 
             cube_feat = rearrange(gs_cube.F, "n (c gpc) -> n c gpc", gpc=self.gpc)
             cube_opacities = cube_feat[:, :1].sigmoid()
@@ -820,6 +841,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         anchor_base=4,
         disorder:bool=False,
         noise_ratio:float=0.0,
+        scene=None,
     ):
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
@@ -847,6 +869,9 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             )
         else:
             # chunk the data to v=view_base
+            # hardcoded ind
+            # ind1 = [0,4,6,7]
+            # ind2 = [1,2,3,5]
             n_chunk = v//view_base
             result_dict_all = []
             contexts_new = {}
@@ -854,6 +879,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                 context_tmp = {}
                 for key in context.keys():
                     # context_tmp[key] = context[key][:, n*view_base:(n+1)*view_base]
+                    # context_tmp[key] = context[key][:, ind1 if n%2==0 else ind2]
                     context_tmp[key] = context[key][:, n::n_chunk]
                     if key not in contexts_new.keys():
                         contexts_new[key] = [context_tmp[key]]
@@ -969,6 +995,8 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                     match_prob]
 
         out = torch.cat(concat, dim=1)
+        nv = context["image"].shape[1]
+        torch.save(rearrange(out, 'v c h w -> (v h w) c'), 'sem_seg/depthsplat_input_features_{}v/{}_features.pt'.format(nv,scene))
         depths = rearrange(depth, "b v h w -> b v (h w) () ()")
         if self.gs_cube:
             '''
@@ -1003,12 +1031,14 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
        
             # torch.save(gs_cube.F, 'notes/gscube_feats.pth')
             # torch.save(gs_cube.C, 'notes/gscube_coords.pth')
+            nv = context["image"].shape[1]
+            torch.save(input_cube_tensor.sp.F, 'sem_seg/input_features_{}v/{}_features.pt'.format(nv,scene))
             cube_feat = rearrange(gs_cube.F, "n (c gpc) -> n c gpc", gpc=self.gpc)
             cube_opacities = cube_feat[:, :1].sigmoid()
             offset_xyz = cube_feat[:, 1:4].sigmoid()
             voxel_size = input_cube_tensor.cell_sizes
             # xyz = gs_cube.C.type(torch.float32)[:,1:4]
-            '''Make sure the grad is backpropagated from output opacities to input depth, thus to before encoder'''
+            '''Make sure the grad is backpropagated from output opacities to input depth, thus to front encoder'''
             xyz = gs_cube.C.type(torch.float32)[:,1:4] + coords_sp_input.F[:, 1:4] - coords_sp_input.F[:, 1:4].detach()
             #xyz = gs_cube.C.type(torch.float32)[:,1:4]
 

@@ -12,7 +12,7 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "env": {
-                "CUDA_VISIBLE_DEVICES": "9",
+                "CUDA_VISIBLE_DEVICES": "1",
                 "OMP_NUM_THREADS": "32",
                 // "MASTER_ADDR": "localhost",
                 // "MASTER_PORT": "12345",
